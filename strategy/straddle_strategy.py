@@ -81,10 +81,18 @@ from strategy.order_manager import (
     OptionLegType,
     OrderManager,
     StraddleExecutionStatus,
+    StraddleExitExecution,
+    StraddleExitState,
     StraddleOrder,
     UnmatchedLegPolicy,
 )
 from strategy.position_tracker import PositionTracker, StraddlePosition
+from strategy.risk_manager import (
+    RiskManager,
+    RiskManagerState,
+    RiskTriggerEvent,
+    RiskTriggerType,
+)
 
 logger = logging.getLogger("btc_straddle.strategy")
 
@@ -95,7 +103,7 @@ logger = logging.getLogger("btc_straddle.strategy")
 
 
 class StraddleStrategyState(str, Enum):
-    """Internal finite state machine for the Level 1 Straddle Strategy."""
+    """Internal finite state machine for the Level 2 Straddle Strategy."""
 
     INITIALIZING = "INITIALIZING"              # Node/Strategy starting up
     AWAITING_INSTRUMENTS = "AWAITING_INSTRUMENTS"  # Loading options chain
@@ -106,7 +114,10 @@ class StraddleStrategyState(str, Enum):
     READY_TO_ENTER = "READY_TO_ENTER"          # Pre-trade checks passed
     SUBMITTING_ORDERS = "SUBMITTING_ORDERS"    # Submitting short Call and Put orders
     AWAITING_FILLS = "AWAITING_FILLS"          # Orders accepted, waiting executions
-    POSITION_ACTIVE = "POSITION_ACTIVE"        # Both legs short; monitoring position
+    POSITION_ACTIVE = "POSITION_ACTIVE"        # Both legs short; continuous risk monitoring live
+    RISK_TRIGGERED = "RISK_TRIGGERED"          # 1% Stop-Loss or 2% Take-Profit breached
+    CLOSING_ORDERS_SUBMITTED = "CLOSING_ORDERS_SUBMITTED"  # Offsetting BUY orders submitted
+    POSITION_CLOSED = "POSITION_CLOSED"        # Straddle fully closed; both positions verified flat
     UNMATCHED_RECOVERING = "UNMATCHED_RECOVERING"  # One leg filled; resolving orphan leg
     STOPPED = "STOPPED"                        # Clean shutdown completed
 
@@ -118,7 +129,7 @@ class StraddleStrategyState(str, Enum):
 
 class BtcShortStraddleStrategyConfig(StrategyConfig, frozen=True):
     """
-    Configuration model for BtcShortStraddleStrategy.
+    Configuration model for BtcShortStraddleStrategy (Level 2).
     """
 
     btc_symbol: str = "BTC"
@@ -129,6 +140,9 @@ class BtcShortStraddleStrategyConfig(StrategyConfig, frozen=True):
     entry_timeout_seconds: float = 10.0
     unmatched_leg_policy: str = "CANCEL_AND_CLOSE"
     min_dte_hours: float = 2.0
+    stop_loss_percent: float = 1.0       # 1% Stop-Loss (+1.0% buyback liability increase)
+    take_profit_percent: float = 2.0     # 2% Take-Profit (-2.0% buyback liability decrease)
+    auto_close_on_risk: bool = True      # Automatically submit closing orders upon risk trigger
 
 
 # -----------------------------------------------------------------------------
@@ -169,6 +183,15 @@ class BtcShortStraddleStrategy(Strategy):
 
         # OrderManager instantiated during on_start when trader_id and order_factory are bound
         self.order_manager: Optional[OrderManager] = None
+
+        # Level 2 Risk Manager & Exit Execution
+        self.risk_manager = RiskManager(
+            stop_loss_percent=config.stop_loss_percent,
+            take_profit_percent=config.take_profit_percent,
+            max_quote_age_seconds=config.max_quote_age_seconds,
+            on_trigger_callback=self._on_risk_trigger,
+        )
+        self.exit_execution: Optional[StraddleExitExecution] = None
 
         # State tracking
         self.strategy_state: StraddleStrategyState = StraddleStrategyState.INITIALIZING
@@ -226,6 +249,14 @@ class BtcShortStraddleStrategy(Strategy):
             unmatched_policy=self.config.unmatched_leg_policy,
             dry_run=self.config.dry_run,
             clock=clk,
+        )
+
+        # Wire PositionTracker and RiskManager to OrderManager (Level 2)
+        self.order_manager.set_position_tracker(self.position_tracker)
+        self.risk_manager.link_order_manager(
+            self.order_manager,
+            self.position_tracker,
+            auto_execute_exit=self.config.auto_close_on_risk,
         )
 
         # 1. Subscribe to underlying reference quote if msgbus is registered
@@ -319,15 +350,26 @@ class BtcShortStraddleStrategy(Strategy):
             if self.strategy_state == StraddleStrategyState.VALIDATING_QUOTES and not self.orders_submitted:
                 self._check_quotes_and_submit_straddle()
 
+            # Level 2: Continuous Risk Monitoring during active position
+            elif self.strategy_state in (
+                StraddleStrategyState.POSITION_ACTIVE,
+                StraddleStrategyState.CLOSING_ORDERS_SUBMITTED,
+            ):
+                if self.risk_manager.is_armed:
+                    self.risk_manager.on_quote_tick(tick)
+
     # -------------------------------------------------------------------------
     # ATM Selection & Market Data Subscription
     # -------------------------------------------------------------------------
 
     async def _async_load_options_chain(self) -> None:
         """Asynchronously load the active Bybit BTC options chain."""
+        if self.options_chain is not None:
+            return
         logger.info("Loading active BTC options chain from Bybit Testnet...")
         chain = await self.discovery_service.discover_btc_options()
-        self.set_options_chain(chain)
+        if self.options_chain is None:
+            self.set_options_chain(chain)
 
     def set_options_chain(self, chain: DiscoveredOptionsChain) -> None:
         """Register the options chain and advance state machine."""
@@ -515,9 +557,34 @@ class BtcShortStraddleStrategy(Strategy):
         px = float(event.last_px)
         self.position_tracker.apply_fill(inst_id, side_str, qty, px)
 
-        # Check straddle status
-        if self.straddle_order:
-            if self.straddle_order.is_one_leg_filled:
+        # Check entry straddle status if awaiting entry fills or not yet armed
+        if (
+            self.strategy_state in (
+                StraddleStrategyState.SUBMITTING_ORDERS,
+                StraddleStrategyState.AWAITING_FILLS,
+                StraddleStrategyState.UNMATCHED_RECOVERING,
+            )
+            or not self.risk_manager.is_armed
+        ) and self.straddle_order and event.order_side == OrderSide.SELL:
+            straddle_pos = self.position_tracker.get_straddle_position()
+            if self.straddle_order.is_fully_filled:
+                if (
+                    straddle_pos
+                    and straddle_pos.call_position.is_open
+                    and straddle_pos.put_position.is_open
+                ):
+                    self.strategy_state = StraddleStrategyState.POSITION_ACTIVE
+                    if not self.risk_manager.is_armed:
+                        self.risk_manager.arm_from_straddle_position(straddle_pos)
+                        logger.info(
+                            f"SUCCESS: Straddle position fully opened!\n"
+                            f"  Call Leg: {self.straddle_order.call_leg.filled_quantity} BTC @ ${self.straddle_order.call_leg.average_price:.2f}\n"
+                            f"  Put  Leg: {self.straddle_order.put_leg.filled_quantity} BTC @ ${self.straddle_order.put_leg.average_price:.2f}\n"
+                            f"  Net Premium Collected: ${self.straddle_order.net_premium_collected:.2f} USDT\n"
+                            f"  Stop-Loss Threshold (+1%): ${self.risk_manager.sl_threshold:.2f} USDT\n"
+                            f"  Take-Profit Target (-2%):  ${self.risk_manager.tp_threshold:.2f} USDT"
+                        )
+            elif self.straddle_order.is_one_leg_filled:
                 logger.warning(
                     f"CRITICAL: Unmatched leg detected in strategy! "
                     f"Call={self.straddle_order.call_leg.status.value}, "
@@ -527,14 +594,35 @@ class BtcShortStraddleStrategy(Strategy):
                 self.strategy_state = StraddleStrategyState.UNMATCHED_RECOVERING
                 self.order_manager.resolve_unmatched_leg(self.straddle_order)
 
-            elif self.straddle_order.is_fully_filled:
-                self.strategy_state = StraddleStrategyState.POSITION_ACTIVE
-                logger.info(
-                    f"SUCCESS: Straddle position fully opened!\n"
-                    f"  Call Leg: {self.straddle_order.call_leg.filled_quantity} BTC @ ${self.straddle_order.call_leg.average_price:.2f}\n"
-                    f"  Put  Leg: {self.straddle_order.put_leg.filled_quantity} BTC @ ${self.straddle_order.put_leg.average_price:.2f}\n"
-                    f"  Net Premium Collected: ${self.straddle_order.net_premium_collected:.2f} USDT"
-                )
+        # Level 2: Monitor closing exit orders and verify flat
+        if self.strategy_state in (
+            StraddleStrategyState.RISK_TRIGGERED,
+            StraddleStrategyState.CLOSING_ORDERS_SUBMITTED,
+        ):
+            active_exit = self.order_manager.active_exit
+            if active_exit is not None:
+                if active_exit.state == StraddleExitState.EXIT_COMPLETED:
+                    if self.position_tracker.is_flat:
+                        self.strategy_state = StraddleStrategyState.POSITION_CLOSED
+                        self.risk_manager.resolve_exit(active_exit)
+                        straddle_pos = self.position_tracker.get_straddle_position()
+                        realized = straddle_pos.total_realized_pnl if straddle_pos else 0.0
+                        logger.info(
+                            f"LEVEL 2 COMPLETE: Both positions confirmed FLAT!\n"
+                            f"  Trigger Type: {active_exit.trigger_type}\n"
+                            f"  Total Exit Buyback Cost: ${active_exit.total_exit_cost:.2f} USDT\n"
+                            f"  Realized Straddle PnL: ${realized:.2f} USDT"
+                        )
+
+    def _on_risk_trigger(self, event: RiskTriggerEvent) -> None:
+        """Invoked when RiskManager breaches Stop-Loss or Take-Profit threshold (Level 2)."""
+        logger.warning(
+            f"STRATEGY RISK TRIGGERED [{event.trigger_type.value}]: {event.trigger_reason}"
+        )
+        self.strategy_state = StraddleStrategyState.RISK_TRIGGERED
+        if self.config.auto_close_on_risk and self.order_manager:
+            self.strategy_state = StraddleStrategyState.CLOSING_ORDERS_SUBMITTED
+            self.exit_execution = self.order_manager.active_exit
 
     # -------------------------------------------------------------------------
     # Position Callbacks

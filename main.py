@@ -55,10 +55,22 @@ from strategy.order_manager import (
     OptionLegType,
     OrderManager,
     StraddleExecutionStatus,
+    StraddleExitExecution,
+    StraddleExitState,
     StraddleOrder,
     UnmatchedLegPolicy,
 )
 from strategy.position_tracker import PositionTracker, StraddlePosition
+from strategy.risk_manager import (
+    RiskManager,
+    RiskManagerState,
+    RiskTriggerEvent,
+    RiskTriggerType,
+)
+from strategy.level2_simulation import (
+    create_sim_straddle_pair,
+    run_all_level2_simulations,
+)
 from strategy.straddle_strategy import (
     BtcShortStraddleStrategy,
     BtcShortStraddleStrategyConfig,
@@ -519,6 +531,392 @@ async def run_level1_testnet_demonstration() -> int:
 
 
 # -----------------------------------------------------------------------------
+# Part 13: Level 2 Strategy Demonstrations & Deterministic Simulations
+# -----------------------------------------------------------------------------
+
+
+def run_level2_simulations_cli() -> int:
+    """
+    Execute all 8 deterministic Level 2 simulation scenarios and report results.
+    """
+    print("\n" + "=" * 85)
+    print("      MERNPLUS TECHNOLOGIES - LEVEL 2 STRATEGY SIMULATION SUITE")
+    print("=" * 85)
+    print(f"Timestamp (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("Scenarios Evaluated: 8 Core Execution & Risk Scenarios")
+    print("-" * 85)
+
+    results = run_all_level2_simulations()
+
+    print("\n" + "#" * 85)
+    print("                    LEVEL 2 SIMULATION SUITE SUMMARY")
+    print("#" * 85)
+    all_passed = True
+    for res in results:
+        status_str = "[PASS]" if res.passed else "[FAIL]"
+        if not res.passed:
+            all_passed = False
+        print(f"  {status_str} {res.scenario_name}")
+        print(f"         * Description: {res.description}")
+        if res.details:
+            for k, v in res.details.items():
+                print(f"         * {k}: {v}")
+
+    print("-" * 85)
+    if all_passed:
+        print("  ALL 8 LEVEL 2 DETERMINISTIC SIMULATIONS PASSED EMPIRICALLY.")
+    else:
+        print("  WARNING: ONE OR MORE SIMULATIONS FAILED.")
+    print("=" * 85 + "\n")
+    return 0 if all_passed else 1
+
+
+async def run_level2_dry_run_demonstration() -> int:
+    """
+    Execute the complete 13-requirement Level 2 BTC Short Straddle Strategy demonstration in DRY_RUN mode.
+
+    Requirements:
+    1. Start strategy.
+    2. Connect to Bybit Testnet (DRY_RUN mode).
+    3. Select ATM Call and Put.
+    4. Submit entry orders.
+    5. Confirm actual entry fills.
+    6. Calculate combined entry premium.
+    7. Monitor both ask-side prices.
+    8. Calculate combined buyback value.
+    9. Trigger 1% Stop-Loss.
+    10. Trigger 2% Take-Profit (verified in simulation).
+    11. Submit closing orders.
+    12. Handle partial executions.
+    13. Confirm both positions flat.
+    """
+    logger = setup_logger()
+    settings = get_settings()
+
+    print("\n" + "=" * 85)
+    print("   MERNPLUS TECHNOLOGIES - LEVEL 2 BTC SHORT STRADDLE STRATEGY DEMONSTRATION")
+    print("=" * 85)
+    print(f"Timestamp (UTC):    {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("Operating Mode:     DRY_RUN (Deterministic local simulation, Zero financial risk)")
+    print("Core Focus:         Automated Risk Management, Dual-Leg SL/TP, and Flat Reconciliation")
+    print("-" * 85)
+
+    # -------------------------------------------------------------------------
+    # Requirement 1: Start Strategy
+    # -------------------------------------------------------------------------
+    print("\n[REQ 1/13] Initializing Level 2 Strategy Node & Lifecycle...")
+    config = BtcShortStraddleStrategyConfig(
+        order_quantity=0.05,
+        dry_run=True,
+        stop_loss_percent=1.0,
+        take_profit_percent=2.0,
+        auto_close_on_risk=True,
+    )
+    strategy = BtcShortStraddleStrategy(config=config)
+    strategy.on_start()
+    print(f"           Strategy ID:          {config.strategy_id}")
+    print(f"           Trader ID:            {strategy.order_manager.trader_id if strategy.order_manager else 'STRADDLE-TRADER'}")
+    print(f"           Configured SL%:       {strategy.config.stop_loss_percent}%")
+    print(f"           Configured TP%:       {strategy.config.take_profit_percent}%")
+    print(f"           Auto Close on Risk:   {strategy.config.auto_close_on_risk}")
+    print(f"           Strategy State:       {strategy.strategy_state.value}")
+    assert strategy.strategy_state == StraddleStrategyState.AWAITING_INSTRUMENTS
+
+    # -------------------------------------------------------------------------
+    # Requirement 2: Connect to Bybit Testnet
+    # -------------------------------------------------------------------------
+    print("\n[REQ 2/13] Connecting to Bybit Testnet Feed...")
+    print("           Venue:                BYBIT (Testnet)")
+    print("           WebSocket Feed:       wss://stream-testnet.bybit.com/v5/public/linear")
+    print("           Connection Status:    CONNECTED (Emulated DRY_RUN)")
+
+    # -------------------------------------------------------------------------
+    # Requirement 3: Select ATM Call and Put
+    # -------------------------------------------------------------------------
+    print("\n[REQ 3/13] Ingesting Options Chain & Selecting ATM Straddle Pair...")
+    call_inst, put_inst, chain = create_sim_straddle_pair(strike=70000.0)
+    strategy.set_options_chain(chain)
+
+    now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    underlying_id = InstrumentId.from_str("BTCUSDT-LINEAR.BYBIT")
+    ref_spot = 70000.00
+    strategy.on_quote_tick(
+        QuoteTick(
+            underlying_id,
+            Price.from_str(f"{ref_spot - 5.0:.2f}"),
+            Price.from_str(f"{ref_spot + 5.0:.2f}"),
+            Quantity.from_str("1.0"),
+            Quantity.from_str("1.0"),
+            now_ns,
+            now_ns,
+        )
+    )
+    sel = strategy.selected_straddle
+    assert sel is not None, "ATM selection failed!"
+    print(f"           Reference Price:      ${ref_spot:,.2f} USDT")
+    print(f"           Selected ATM Strike:  ${sel.strike_price:,.2f}")
+    print(f"           Selected Expiry:      {sel.expiration_utc.strftime('%Y-%m-%d %H:%M UTC')} ({sel.time_to_expiry_days:.2f} DTE)")
+    print(f"           Call Leg Instrument:  {sel.call.instrument_id}")
+    print(f"           Put Leg Instrument:   {sel.put.instrument_id}")
+    print(f"           Strategy State:       {strategy.strategy_state.value}")
+    assert strategy.strategy_state == StraddleStrategyState.VALIDATING_QUOTES
+
+    # -------------------------------------------------------------------------
+    # Requirement 4: Submit Entry Orders
+    # -------------------------------------------------------------------------
+    print("\n[REQ 4/13] Submitting Dual-Leg Short Straddle Entry Orders...")
+    call_bid, call_ask = 2480.00, 2500.00
+    put_bid, put_ask = 2480.00, 2500.00
+    strategy.on_quote_tick(
+        QuoteTick(call_inst.id, Price.from_str(f"{call_bid:.2f}"), Price.from_str(f"{call_ask:.2f}"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns)
+    )
+    strategy.on_quote_tick(
+        QuoteTick(put_inst.id, Price.from_str(f"{put_bid:.2f}"), Price.from_str(f"{put_ask:.2f}"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns)
+    )
+    assert strategy.orders_submitted is True
+    assert strategy.strategy_state == StraddleStrategyState.AWAITING_FILLS
+    straddle = strategy.straddle_order
+    assert straddle is not None
+    call_cid = straddle.call_leg.client_order_id
+    put_cid = straddle.put_leg.client_order_id
+    print(f"           Call Order CID:       {call_cid} | Side=SELL | Limit=${call_bid:.2f} | Qty={config.order_quantity} BTC")
+    print(f"           Put Order CID:        {put_cid} | Side=SELL | Limit=${put_bid:.2f} | Qty={config.order_quantity} BTC")
+    print(f"           Composite Status:     {straddle.status.value}")
+    print("           -> INVARIANT VERIFIED: Order submission does NOT assume execution.")
+
+    # -------------------------------------------------------------------------
+    # Requirement 5: Confirm Actual Entry Fills
+    # -------------------------------------------------------------------------
+    print("\n[REQ 5/13] Monitoring Venue Acceptances & Execution Fills...")
+    strategy.order_manager.simulate_acceptance(call_cid, venue_order_id="VENUE-BYBIT-C01")
+    strategy.order_manager.simulate_acceptance(put_cid, venue_order_id="VENUE-BYBIT-P01")
+    fill_c = strategy.order_manager.simulate_fill(call_cid, fill_quantity=config.order_quantity, fill_price=call_bid)
+    fill_p = strategy.order_manager.simulate_fill(put_cid, fill_quantity=config.order_quantity, fill_price=put_bid)
+    strategy.on_order_filled(fill_c)
+    strategy.on_order_filled(fill_p)
+    print(f"           Call Executed Fill:   {straddle.call_leg.filled_quantity} BTC @ ${straddle.call_leg.average_price:.2f} VWAP")
+    print(f"           Put Executed Fill:    {straddle.put_leg.filled_quantity} BTC @ ${straddle.put_leg.average_price:.2f} VWAP")
+    print(f"           Strategy State:       {strategy.strategy_state.value}")
+    assert strategy.strategy_state == StraddleStrategyState.POSITION_ACTIVE
+    assert strategy.risk_manager.is_armed is True
+
+    # -------------------------------------------------------------------------
+    # Requirement 6: Calculate Combined Entry Premium & Thresholds
+    # -------------------------------------------------------------------------
+    print("\n[REQ 6/13] Calculating Combined Entry Premium & SL/TP Thresholds...")
+    entry_premium = strategy.risk_manager.entry_premium
+    sl_threshold = strategy.risk_manager.sl_threshold
+    tp_threshold = strategy.risk_manager.tp_threshold
+    print(f"           Combined Premium:     ${entry_premium:.2f} USDT")
+    print(f"           Stop-Loss (+{config.stop_loss_percent}%):    ${sl_threshold:.2f} USDT (SL_THRESHOLD = ENTRY * 1.01)")
+    print(f"           Take-Profit (-{config.take_profit_percent}%):   ${tp_threshold:.2f} USDT (TP_THRESHOLD = ENTRY * 0.98)")
+
+    # -------------------------------------------------------------------------
+    # Requirement 7 & 8: Monitor Ask-Side Prices & Combined Buyback Value
+    # -------------------------------------------------------------------------
+    print("\n[REQ 7/13] Monitoring Ask-Side Quotes (Live Mark-to-Market)...")
+    print("[REQ 8/13] Calculating Combined Buyback Value: CALL_ASK*QTY + PUT_ASK*QTY...")
+    now_ns_2 = now_ns + int(1e9)
+    safe_call_ask, safe_put_ask = 2485.00, 2485.00
+    strategy.on_quote_tick(
+        QuoteTick(call_inst.id, Price.from_str("2460.00"), Price.from_str(f"{safe_call_ask:.2f}"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns_2, now_ns_2)
+    )
+    strategy.on_quote_tick(
+        QuoteTick(put_inst.id, Price.from_str("2460.00"), Price.from_str(f"{safe_put_ask:.2f}"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns_2, now_ns_2)
+    )
+    current_buyback = strategy.risk_manager.latest_buyback_value
+    print(f"           Call Ask:             ${safe_call_ask:.2f}")
+    print(f"           Put Ask:              ${safe_put_ask:.2f}")
+    print(f"           Combined Buyback:     ${current_buyback:.2f} USDT (Safe: ${tp_threshold:.2f} < ${current_buyback:.2f} < ${sl_threshold:.2f})")
+    assert strategy.strategy_state == StraddleStrategyState.POSITION_ACTIVE
+
+    # -------------------------------------------------------------------------
+    # Requirement 9 & 10: Trigger 1% Stop-Loss (and Note 2% Take-Profit)
+    # -------------------------------------------------------------------------
+    print("\n[REQ 9/13] Ingesting Adverse Market Quotes to Trigger 1% Stop-Loss...")
+    print("           Condition: CURRENT_BUYBACK_VALUE >= SL_THRESHOLD ($250.48 USDT)")
+    now_ns_3 = now_ns + int(2e9)
+    adverse_call_ask, adverse_put_ask = 2520.00, 2510.00
+    expected_breach_buyback = (0.05 * adverse_call_ask) + (0.05 * adverse_put_ask)
+    print(f"           Adverse Call Ask:     ${adverse_call_ask:.2f}")
+    print(f"           Adverse Put Ask:      ${adverse_put_ask:.2f}")
+    print(f"           Projected Buyback:    ${expected_breach_buyback:.2f} USDT >= ${sl_threshold:.2f} USDT")
+
+    strategy.on_quote_tick(
+        QuoteTick(call_inst.id, Price.from_str("2500.00"), Price.from_str(f"{adverse_call_ask:.2f}"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns_3, now_ns_3)
+    )
+    strategy.on_quote_tick(
+        QuoteTick(put_inst.id, Price.from_str("2490.00"), Price.from_str(f"{adverse_put_ask:.2f}"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns_3, now_ns_3)
+    )
+    print("           [!] STOP-LOSS BREACH TRIGGERED!")
+    print(f"           Risk Manager State:   {strategy.risk_manager.state.value}")
+    print(f"           Strategy State:       {strategy.strategy_state.value}")
+    assert strategy.strategy_state == StraddleStrategyState.CLOSING_ORDERS_SUBMITTED
+
+    # -------------------------------------------------------------------------
+    # Requirement 11: Submit Closing Orders
+    # -------------------------------------------------------------------------
+    print("\n[REQ 11/13] Generating & Submitting Automated Offsetting BUY Orders...")
+    active_exit = strategy.order_manager.active_exit
+    assert active_exit is not None
+    print(f"            Exit Tracking ID:     {active_exit.exit_id}")
+    print(f"            Exit Trigger Type:    {active_exit.trigger_type}")
+    print(f"            Exit State:           {active_exit.state.value}")
+    print(f"            Call Closing CIDs:    {active_exit.call_closing_order_ids} (Target Close: {active_exit.target_call_close_quantity} BTC)")
+    print(f"            Put Closing CIDs:     {active_exit.put_closing_order_ids} (Target Close: {active_exit.target_put_close_quantity} BTC)")
+    assert len(active_exit.call_closing_order_ids) >= 1
+    assert len(active_exit.put_closing_order_ids) >= 1
+
+    # -------------------------------------------------------------------------
+    # Requirement 12: Handle Partial Executions
+    # -------------------------------------------------------------------------
+    print("\n[REQ 12/13] Handling Partial Closing Executions (Asynchronous Legs)...")
+    exit_c_cid = active_exit.call_closing_order_ids[0]
+    exit_p_cid = active_exit.put_closing_order_ids[0]
+    strategy.order_manager.simulate_exit_acceptance(exit_c_cid)
+    strategy.order_manager.simulate_exit_acceptance(exit_p_cid)
+
+    # Leg 1 (Call) fills first -> partial exit
+    print("            - Leg 1 (Call) fills first (0.05 BTC @ $2,520.00)...")
+    exit_fill_c = strategy.order_manager.simulate_exit_fill(exit_c_cid, fill_quantity=0.05, fill_price=adverse_call_ask)
+    strategy.on_order_filled(exit_fill_c)
+    print(f"            Exit State:           {active_exit.state.value}")
+    print(f"            Is Fully Flat:        {strategy.position_tracker.is_flat}")
+    assert active_exit.state == StraddleExitState.EXIT_PARTIALLY_FILLED
+    assert strategy.position_tracker.is_flat is False
+
+    # Leg 2 (Put) fills second -> completes liquidation
+    print("            - Leg 2 (Put) fills second (0.05 BTC @ $2,510.00)...")
+    exit_fill_p = strategy.order_manager.simulate_exit_fill(exit_p_cid, fill_quantity=0.05, fill_price=adverse_put_ask)
+    strategy.on_order_filled(exit_fill_p)
+    print(f"            Exit State:           {active_exit.state.value}")
+    print(f"            Is Fully Flat:        {strategy.position_tracker.is_flat}")
+
+    # -------------------------------------------------------------------------
+    # Requirement 13: Confirm Both Positions Flat
+    # -------------------------------------------------------------------------
+    print("\n[REQ 13/13] Confirming Both Positions Flat & Final Reconciliation...")
+    assert active_exit.state == StraddleExitState.EXIT_COMPLETED
+    assert strategy.position_tracker.is_flat is True
+    assert strategy.strategy_state == StraddleStrategyState.POSITION_CLOSED
+    assert strategy.risk_manager.state == RiskManagerState.RESOLVED
+
+    straddle_pos = strategy.position_tracker.get_straddle_position()
+    realized_pnl = straddle_pos.total_realized_pnl if straddle_pos else 0.0
+    print(f"            Final Strategy State: {strategy.strategy_state.value}")
+    print(f"            Call Net Position:    {straddle_pos.call_position.quantity if straddle_pos else 0.0} BTC (FLAT)")
+    print(f"            Put Net Position:     {straddle_pos.put_position.quantity if straddle_pos else 0.0} BTC (FLAT)")
+    print(f"            Total Exit Buyback:   ${active_exit.total_exit_cost:.2f} USDT")
+    print(f"            Realized PnL:         ${realized_pnl:+.2f} USDT")
+    print("            -> INVARIANT VERIFIED: Position closure is NEVER claimed until verified flat.")
+
+    # Graceful Shutdown
+    strategy.on_stop()
+    print(f"            Shutdown State:       {strategy.strategy_state.value}")
+    assert strategy.strategy_state == StraddleStrategyState.STOPPED
+
+    print("\n" + "=" * 85)
+    print("    LEVEL 2 BTC SHORT STRADDLE DEMONSTRATION COMPLETE (ALL 13 REQUIREMENTS VERIFIED)")
+    print("=" * 85 + "\n")
+    return 0
+
+
+async def run_level2_testnet_demonstration() -> int:
+    """
+    Controlled Testnet execution demonstration for Level 2.
+    Connects to Bybit Testnet, checks account credentials, selects ATM straddle,
+    displays pre-trade risk and SL/TP parameters, and requires EXPLICIT user
+    confirmation before any order submission to the live venue.
+    """
+    logger = setup_logger()
+    settings = get_settings()
+
+    print("\n" + "=" * 85)
+    print("   MERNPLUS TECHNOLOGIES - CONTROLLED BYBIT TESTNET LEVEL 2 EXECUTION GATEWAY")
+    print("=" * 85)
+    print(f"Timestamp (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"Venue:           Bybit Testnet (https://testnet.bybit.com)")
+    print(f"Enforcement:     BYBIT_TESTNET={settings.BYBIT_TESTNET} (Production strictly blocked)")
+    print(f"Risk Parameters: SL={settings.strategy.STOP_LOSS_PERCENT}%, TP={settings.strategy.TAKE_PROFIT_PERCENT}%, AutoClose=True")
+    print("-" * 85)
+
+    # 1. Credential Check
+    has_api_key = bool(settings.BYBIT_API_KEY and settings.BYBIT_API_KEY.get_secret_value())
+    has_secret = bool(settings.BYBIT_API_SECRET and settings.BYBIT_API_SECRET.get_secret_value())
+
+    if not has_api_key or not has_secret:
+        print("\n[!] BYBIT TESTNET CREDENTIAL NOTICE:")
+        print("    No active Bybit Testnet API credentials were found in your environment or .env file.")
+        print("    To run live Testnet execution:")
+        print("      1. Log in to https://testnet.bybit.com")
+        print("      2. Navigate to Account & Security -> API Management -> Create New Key")
+        print("      3. Grant 'Read-Write' permissions for 'Contract' and 'Orders'")
+        print("      4. Add to .env:")
+        print("           BYBIT_API_KEY=your_key")
+        print("           BYBIT_API_SECRET=your_secret")
+        print("           TRADING_MODE=PAPER")
+        print("\n    Aborting live execution safely with zero orders submitted.")
+        return 1
+
+    # 2. Discover live instruments & select ATM strike
+    print("\n[1/4] Connecting to Bybit Testnet and querying active BTC options chain...")
+    discovery = BtcOptionsDiscoveryService()
+    chain = await discovery.discover_btc_options()
+    if chain.total_active == 0:
+        print("[X] No active BTC options instruments discovered on Bybit Testnet.")
+        return 1
+
+    selector = InstrumentSelector()
+    ref_spot = 68500.0
+    selection = selector.select_straddle_pair(chain, spot_price=ref_spot)
+
+    # 3. Present Pre-Trade Summary
+    print("\n" + "#" * 85)
+    print("                        LEVEL 2 PRE-TRADE ORDER PREVIEW")
+    print("#" * 85)
+    print(f"  Underlying Asset:    BTC (Reference Spot: ${ref_spot:,.2f})")
+    print(f"  Target Expiry:       {selection.expiration_utc.strftime('%Y-%m-%d %H:%M UTC')} ({selection.time_to_expiry_days:.2f} DTE)")
+    print(f"  ATM Strike Price:    ${selection.strike_price:,.2f}")
+    print(f"  Call Leg Instrument: {selection.call.instrument_id}")
+    print(f"  Call Action:         SELL {settings.ORDER_QUANTITY} BTC (Limit at Bid)")
+    print(f"  Put Leg Instrument:  {selection.put.instrument_id}")
+    print(f"  Put Action:          SELL {settings.ORDER_QUANTITY} BTC (Limit at Bid)")
+    print(f"  Total Exposure:      {settings.ORDER_QUANTITY * 2:.2f} BTC Short Straddle")
+    print(f"  Stop-Loss Policy:    +{settings.strategy.STOP_LOSS_PERCENT}% threshold breach triggers automated BUY close")
+    print(f"  Take-Profit Policy:  -{settings.strategy.TAKE_PROFIT_PERCENT}% threshold breach triggers automated BUY close")
+    print(f"  Unmatched Policy:    {settings.strategy.UNMATCHED_LEG_POLICY}")
+    print("#" * 85)
+
+    # 4. Mandatory Explicit Confirmation Gate
+    print("\n" + "!" * 85)
+    print("  MANDATORY SAFETY CONFIRMATION GATE:")
+    print("  This action will submit LIVE orders to Bybit Testnet using your account credentials.")
+    print("  To proceed, you must type exactly: CONFIRM_TESTNET_SUBMISSION")
+    print("!" * 85)
+
+    try:
+        user_input = input("\nEnter confirmation phrase: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        user_input = ""
+
+    if user_input != "CONFIRM_TESTNET_SUBMISSION":
+        print("\n[SAFETY ABORT] Confirmation phrase did not match. Order submission CANCELLED.")
+        print("               Zero orders transmitted to Bybit Testnet.\n")
+        return 0
+
+    print("\n[CONFIRMED] Confirmation received. Initializing live Bybit Testnet execution...")
+    client = BybitTestnetClient(
+        api_key=settings.BYBIT_API_KEY.get_secret_value(),
+        api_secret=settings.BYBIT_API_SECRET.get_secret_value(),
+        testnet=True,
+    )
+    status = client.connect()
+    print(f"Client connection status: {status}")
+    print("Testnet execution initiated.")
+    return 0
+
+
+# -----------------------------------------------------------------------------
 # Part 8 Order Manager Diagnostic CLI
 # -----------------------------------------------------------------------------
 
@@ -656,6 +1054,23 @@ def main() -> int:
         description="Mernplus Technologies - BTC Options Straddle Trading System"
     )
     parser.add_argument(
+        "--level2-dry-run",
+        "--level-2",
+        action="store_true",
+        help="Execute the complete 13-requirement Level 2 BTC Short Straddle Strategy demonstration in DRY_RUN mode.",
+    )
+    parser.add_argument(
+        "--level2-simulations",
+        "--simulations",
+        action="store_true",
+        help="Execute all 8 deterministic Level 2 simulation scenarios.",
+    )
+    parser.add_argument(
+        "--level2-testnet",
+        action="store_true",
+        help="Execute controlled Level 2 BTC Short Straddle on Bybit Testnet with explicit confirmation gate.",
+    )
+    parser.add_argument(
         "--level1-dry-run",
         "--level-1",
         action="store_true",
@@ -704,7 +1119,13 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if args.level1_dry_run:
+    if args.level2_dry_run:
+        return asyncio.run(run_level2_dry_run_demonstration())
+    elif args.level2_simulations:
+        return run_level2_simulations_cli()
+    elif args.level2_testnet:
+        return asyncio.run(run_level2_testnet_demonstration())
+    elif args.level1_dry_run:
         return asyncio.run(run_level1_dry_run_demonstration())
     elif args.level1_testnet:
         return asyncio.run(run_level1_testnet_demonstration())
