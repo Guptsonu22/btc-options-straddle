@@ -223,7 +223,17 @@ class LegOrderTracker:
         """
         Apply a NautilusTrader OrderEvent to the leg tracker, updating state,
         fills, and volume-weighted average execution price.
+        Enforces idempotency so duplicate events (e.g. from network or retry loops)
+        do not corrupt state.
         """
+        # Guard against duplicate event processing (idempotency)
+        event_id_val = getattr(event, "id", None)
+        if event_id_val is not None and any(getattr(e, "id", None) == event_id_val for e in self.events):
+            logger.debug(
+                f"Event {event_id_val} already applied to {self.client_order_id}. Skipping duplicate."
+            )
+            return
+
         self.events.append(event)
         self.updated_at_utc = datetime.now(timezone.utc)
 
@@ -477,7 +487,16 @@ class OrderManager:
         self.submit_fn = submit_fn
         self.cancel_fn = cancel_fn
         self.dry_run = dry_run
-        self.clock = clock or LiveClock()
+
+        # Resolve concrete clock (guard against uninitialized Cython Clock stubs)
+        if clock is not None:
+            try:
+                clock.timestamp_ns()
+                self.clock = clock
+            except (NotImplementedError, AttributeError):
+                self.clock = LiveClock()
+        else:
+            self.clock = LiveClock()
 
         # Normalize unmatched leg policy
         if isinstance(unmatched_policy, str):

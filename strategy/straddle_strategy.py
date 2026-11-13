@@ -206,7 +206,15 @@ class BtcShortStraddleStrategy(Strategy):
         # Determine trader ID, strategy ID, and clock (defaults if unregistered in unit tests)
         tid = getattr(self, "trader_id", None) or TraderId("STRADDLE-TRADER")
         sid = getattr(self, "id", None) or StrategyId("BTC-STRADDLE-001")
-        clk = getattr(self, "clock", None) or LiveClock()
+        clk = None
+        if hasattr(self, "clock") and self.clock is not None:
+            try:
+                self.clock.timestamp_ns()
+                clk = self.clock
+            except (NotImplementedError, AttributeError):
+                clk = LiveClock()
+        if clk is None:
+            clk = LiveClock()
 
         # Initialize OrderManager wired to NautilusTrader order factory & strategy submission
         self.order_manager = OrderManager(
@@ -409,8 +417,8 @@ class BtcShortStraddleStrategy(Strategy):
 
         logger.info(
             f"Option quotes validated:\n"
-            f"  Call: Bid=${call_quote.bid_price:.2f}, Ask=${call_quote.ask_price:.2f} (Age={call_quote.quote_age_seconds:.2f}s)\n"
-            f"  Put:  Bid=${put_quote.bid_price:.2f}, Ask=${put_quote.ask_price:.2f} (Age={put_quote.quote_age_seconds:.2f}s)"
+            f"  Call: Bid=${call_quote.bid_price:.2f}, Ask=${call_quote.ask_price:.2f} (Age={call_quote.age_seconds():.2f}s)\n"
+            f"  Put:  Bid=${put_quote.bid_price:.2f}, Ask=${put_quote.ask_price:.2f} (Age={put_quote.age_seconds():.2f}s)"
         )
 
         self._execute_straddle_entry(call_quote, put_quote)

@@ -438,9 +438,15 @@ class MarketDataManager:
                 ltp_timestamp_utc=ts_utc,
             )
 
-    def get_quote(self, instrument_id: str) -> Optional[ValidatedQuote]:
-        """Retrieve latest validated quote for an instrument."""
-        return self._quotes.get(instrument_id)
+    def get_quote(self, instrument_id: Union[InstrumentId, str]) -> Optional[ValidatedQuote]:
+        """Retrieve latest validated quote for an instrument (accepts InstrumentId or str)."""
+        inst_str = instrument_id.value if isinstance(instrument_id, InstrumentId) else str(instrument_id)
+        # Search by string value to avoid PyO3/Cython strict type equality check exceptions
+        for k, v in self._quotes.items():
+            k_str = k.value if isinstance(k, InstrumentId) else str(k)
+            if k_str == inst_str:
+                return v
+        return None
 
     def get_straddle_snapshot(
         self,

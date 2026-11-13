@@ -142,6 +142,8 @@ def make_test_chain(strike: float = 70000.0) -> Tuple[DiscoveredOptionsChain, Cr
             call_inst.id.value: call_details,
             put_inst.id.value: put_details,
         },
+        _calls_map={(expiry, strike): call_details},
+        _puts_map={(expiry, strike): put_details},
     )
     return chain, call_inst, put_inst
 
@@ -220,7 +222,7 @@ def test_dual_leg_entry_on_option_quotes_dry_run(strategy):
     underlying_id = InstrumentId.from_str("BTCUSDT-LINEAR.BYBIT")
     now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
     strategy.on_quote_tick(
-        QuoteTick(underlying_id, Price.from_str("70000.0"), Price.from_str("70000.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns)
+        QuoteTick(underlying_id, Price.from_str("69990.0"), Price.from_str("70010.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns)
     )
 
     # 2. Call Option quote tick
@@ -256,7 +258,7 @@ def test_complete_straddle_fill_execution(strategy):
     # Underlying and option quotes
     underlying_id = InstrumentId.from_str("BTCUSDT-LINEAR.BYBIT")
     now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
-    strategy.on_quote_tick(QuoteTick(underlying_id, Price.from_str("70000.0"), Price.from_str("70000.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns))
+    strategy.on_quote_tick(QuoteTick(underlying_id, Price.from_str("69990.0"), Price.from_str("70010.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns))
     strategy.on_quote_tick(QuoteTick(call_inst.id, Price.from_str("1200.0"), Price.from_str("1250.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns))
     strategy.on_quote_tick(QuoteTick(put_inst.id, Price.from_str("1100.0"), Price.from_str("1150.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns))
 
@@ -294,7 +296,7 @@ def test_unmatched_leg_recovery_in_strategy(strategy):
     # Quotes and submission
     underlying_id = InstrumentId.from_str("BTCUSDT-LINEAR.BYBIT")
     now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
-    strategy.on_quote_tick(QuoteTick(underlying_id, Price.from_str("70000.0"), Price.from_str("70000.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns))
+    strategy.on_quote_tick(QuoteTick(underlying_id, Price.from_str("69990.0"), Price.from_str("70010.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns))
     strategy.on_quote_tick(QuoteTick(call_inst.id, Price.from_str("1200.0"), Price.from_str("1250.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns))
     strategy.on_quote_tick(QuoteTick(put_inst.id, Price.from_str("1100.0"), Price.from_str("1150.0"), Quantity.from_str("1.0"), Quantity.from_str("1.0"), now_ns, now_ns))
 
