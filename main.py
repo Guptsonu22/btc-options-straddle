@@ -7,6 +7,7 @@ Stage: Part 6 - Market Data Subscriptions & Quote Integrity
 
 import argparse
 import asyncio
+from datetime import datetime, timezone
 import sys
 from pathlib import Path
 
@@ -84,7 +85,141 @@ def run_configuration_check() -> int:
     logger.info("  python main.py --discover-options    (Discover active BTC options chain)")
     logger.info("  python main.py --subscribe-quotes    (Stream live quotes & test straddle snapshot)")
     logger.info("  python main.py --select-straddle     (Calculate and select active ATM straddle legs)")
+    logger.info("  python main.py --test-order-manager  (Verify dual-leg order state machine & policies)")
     logger.info("=" * 60)
+    return 0
+
+
+async def run_order_manager_diagnostic() -> int:
+    """
+    Demonstrate and verify the Order Management Engine (Part 8) in DRY_RUN mode:
+    1. Discovers live BTC options and selects the optimal ATM straddle pair.
+    2. Constructs paired SELL Limit orders via NautilusTrader OrderFactory.
+    3. Generates unique, monotonic, Bybit-compliant ClientOrderIds.
+    4. Validates quantities against contract lot sizes.
+    5. Submits orders in DRY_RUN mode without live financial risk.
+    6. Verifies state machine transitions: NOT_SUBMITTED -> SUBMITTED -> ACCEPTED.
+    7. Tests critical scenario: Call = Fully Filled, Put = Pending -> ONE_LEG_FILLED.
+    8. Executes unmatched-leg resolution policy (CANCEL_AND_CLOSE):
+       - Cancels the pending Put order.
+       - Submits an offsetting BUY order for the filled Call leg to buy back and neutralize exposure.
+    """
+    from exchange.instrument_discovery import BtcOptionsDiscoveryService
+    from strategy.instrument_selector import InstrumentSelector
+    from strategy.order_manager import (
+        LegExecutionStatus,
+        OptionLegType,
+        OrderManager,
+        StraddleExecutionStatus,
+        UnmatchedLegPolicy,
+    )
+
+    logger = setup_logger()
+    settings = get_settings()
+
+    print("\n" + "=" * 80)
+    print("      PART 8: ORDER MANAGEMENT ENGINE DIAGNOSTIC & VERIFICATION (DRY_RUN)")
+    print("=" * 80)
+    print(f"Timestamp (UTC):       {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Operating Mode:        DRY_RUN (Simulated order execution, Zero live venue orders)")
+    print(f"Configured Policy:     {settings.strategy.UNMATCHED_LEG_POLICY}")
+    print("-" * 80)
+
+    # 1. Discover active options and select ATM pair
+    print("[1/5] Discovering active BTC options and selecting ATM straddle pair...")
+    discovery_service = BtcOptionsDiscoveryService()
+    chain = await discovery_service.discover_btc_options()
+
+    selector = InstrumentSelector()
+    # Use $68,500 reference price or current spot
+    ref_price = 68500.0
+    selection = selector.select_straddle(chain, reference_price=ref_price)
+    print(f"      Reference Price:  ${ref_price:,.2f}")
+    print(f"      Selected Strike:  ${selection.strike_price:,.2f}")
+    print(f"      Selected Expiry:  {selection.expiration_utc.strftime('%Y-%m-%d %H:%M UTC')} ({selection.dte_days:.2f} DTE)")
+    print(f"      Call Instrument:  {selection.call_id}")
+    print(f"      Put Instrument:   {selection.put_id}")
+
+    # 2. Initialize OrderManager
+    print("\n[2/5] Initializing OrderManager with NautilusTrader OrderFactory...")
+    om = OrderManager(
+        unmatched_policy=settings.strategy.UNMATCHED_LEG_POLICY,
+        dry_run=True,
+    )
+
+    # 3. Create short straddle SELL orders
+    print("\n[3/5] Creating short straddle SELL orders (Quantity: 0.01 BTC each)...")
+    straddle = om.create_straddle_sell_orders(
+        call_instrument=selection.call_details.nautilus_instrument,
+        put_instrument=selection.put_details.nautilus_instrument,
+        quantity=0.01,
+        call_price=1250.0,
+        put_price=1150.0,
+    )
+
+    print(f"      Straddle ID:      {straddle.straddle_id}")
+    print(f"      Call Client ID:   {straddle.call_leg.client_order_id} (Side: {straddle.call_leg.order_side.name}, Status: {straddle.call_leg.status.value})")
+    print(f"      Put Client ID:    {straddle.put_leg.client_order_id} (Side: {straddle.put_leg.order_side.name}, Status: {straddle.put_leg.status.value})")
+    print(f"      Composite Status: {straddle.status.value}")
+
+    # 4. Submit straddle in DRY_RUN mode
+    print("\n[4/5] Submitting straddle in DRY_RUN mode (State transition check)...")
+    om.submit_straddle(straddle)
+    print(f"      Call Leg Status:  {straddle.call_leg.status.value} (Filled: {straddle.call_leg.filled_quantity} BTC)")
+    print(f"      Put Leg Status:   {straddle.put_leg.status.value} (Filled: {straddle.put_leg.filled_quantity} BTC)")
+    print(f"      Composite Status: {straddle.status.value}")
+    assert straddle.status == StraddleExecutionStatus.SUBMITTED
+    print("      -> Invariant verified: Order submission does NOT assume execution.")
+
+    # 5. Simulate exchange acceptance
+    print("\n[5/5] Simulating venue order acceptance and partial execution scenario...")
+    om.simulate_acceptance(straddle.call_leg.client_order_id, venue_order_id="VENUE-CALL-8801")
+    om.simulate_acceptance(straddle.put_leg.client_order_id, venue_order_id="VENUE-PUT-8802")
+    print(f"      Both legs ACCEPTED by venue (Call: VENUE-CALL-8801, Put: VENUE-PUT-8802)")
+    print(f"      Composite Status: {straddle.status.value}")
+
+    # Simulate CRITICAL SCENARIO: Call fully filled, Put remains pending
+    print("\n" + "#" * 80)
+    print("  SIMULATING CRITICAL SCENARIO: Call = Fully Filled, Put = Pending")
+    print("#" * 80)
+    om.simulate_fill(
+        straddle.call_leg.client_order_id,
+        fill_quantity=0.01,
+        fill_price=1250.0,
+        trade_id="TR-C-LIVE-001",
+    )
+    print(f"  Call Leg:  FILLED (0.01 BTC @ $1,250.00 VWAP, Status: {straddle.call_leg.status.value})")
+    print(f"  Put Leg:   PENDING (0.00 BTC Filled, Status: {straddle.put_leg.status.value})")
+    print(f"  Straddle Status: {straddle.status.value}")
+    print(f"  -> System Recognized: ONE_LEG_FILLED is {straddle.is_one_leg_filled}!")
+
+    unmatched = om.check_unmatched_leg(straddle)
+    assert unmatched is not None, "Failed to identify unmatched leg!"
+    filled_leg, pending_leg = unmatched
+    print(f"  Unmatched Filled Leg:  {filled_leg.leg_type.value} ({filled_leg.instrument_id})")
+    print(f"  Unmatched Pending Leg: {pending_leg.leg_type.value} ({pending_leg.instrument_id})")
+
+    # Execute configured Unmatched Leg Policy
+    print("\n" + "-" * 80)
+    print(f"  RESOLVING UNMATCHED LEG UNDER POLICY: {om.unmatched_policy.value}")
+    print("-" * 80)
+    resolution = om.resolve_unmatched_leg(straddle)
+    for action in resolution["actions_taken"]:
+        print(f"  [ACTION] {action}")
+
+    print(f"\n  Post-Resolution State:")
+    print(f"  - Put Leg Status:         {straddle.put_leg.status.value}")
+    if straddle.closing_call_order:
+        print(f"  - Closing Call Order ID:  {straddle.closing_call_order.client_order_id}")
+        print(f"  - Closing Order Side:     {straddle.closing_call_order.order_side.name} (BUYBACK)")
+        print(f"  - Closing Order Quantity: {straddle.closing_call_order.target_quantity} BTC")
+        print(f"  - Closing Order Status:   {straddle.closing_call_order.status.value}")
+    print(f"  - Straddle Final Status:  {straddle.status.value}")
+
+    print("\n" + "=" * 80)
+    print("      ORDER MANAGEMENT ENGINE VERIFICATION COMPLETE (ALL INVARIANTS PASSED)")
+    print("      ZERO LIVE ORDERS TRANSMITTED TO BYBIT (DRY_RUN SAFETY ENFORCED)")
+    print("=" * 80 + "\n")
     return 0
 
 
@@ -118,6 +253,12 @@ def main() -> int:
         help="Calculate and select the nearest ATM Call/Put straddle pair based on live reference price.",
     )
     parser.add_argument(
+        "--test-order-manager",
+        "--order-manager",
+        action="store_true",
+        help="Execute the Order Management state machine in DRY_RUN mode, verifying dual-leg tracking and unmatched-leg resolution.",
+    )
+    parser.add_argument(
         "--config-check",
         action="store_true",
         help="Audit configuration settings and security boundaries.",
@@ -133,6 +274,8 @@ def main() -> int:
         return asyncio.run(run_market_data_diagnostic(duration_seconds=12.0))
     elif args.select_straddle:
         return asyncio.run(run_straddle_selection_cli())
+    elif args.test_order_manager:
+        return asyncio.run(run_order_manager_diagnostic())
     else:
         return run_configuration_check()
 

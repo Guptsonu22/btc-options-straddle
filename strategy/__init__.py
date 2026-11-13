@@ -11,8 +11,24 @@ from .instrument_selector import (
     TieBreakerPolicy,
     run_straddle_selection_cli,
 )
+from .order_manager import (
+    DuplicateOrderError,
+    InvalidQuantityError,
+    LegExecutionStatus,
+    LegFill,
+    LegOrderTracker,
+    OptionLegType,
+    OrderManagementError,
+    OrderManager,
+    OrderSubmissionError,
+    StraddleExecutionStatus,
+    StraddleOrder,
+    UnmatchedLegError,
+    UnmatchedLegPolicy,
+)
 
 __all__ = [
+    # Instrument Selection
     "ExpirySelectionPolicy",
     "TieBreakerPolicy",
     "SelectedStraddleLegs",
@@ -23,4 +39,19 @@ __all__ = [
     "IncompletePairError",
     "MismatchedPairError",
     "run_straddle_selection_cli",
+    # Order Management
+    "OptionLegType",
+    "LegExecutionStatus",
+    "StraddleExecutionStatus",
+    "UnmatchedLegPolicy",
+    "LegFill",
+    "LegOrderTracker",
+    "StraddleOrder",
+    "OrderManager",
+    "OrderManagementError",
+    "DuplicateOrderError",
+    "InvalidQuantityError",
+    "UnmatchedLegError",
+    "OrderSubmissionError",
 ]
+
