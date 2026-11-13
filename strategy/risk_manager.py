@@ -37,7 +37,7 @@ from decimal import Decimal
 from enum import Enum
 import logging
 import time
-from typing import Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple, Union
 
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId
@@ -230,10 +230,52 @@ class RiskManager:
         self.latest_pnl_percent: Optional[Decimal] = None
         self.trigger_event: Optional[RiskTriggerEvent] = None
 
+        # Automated order manager linkage (Part 12)
+        self.order_manager: Optional[Any] = None
+        self.position_tracker: Optional[Any] = None
+        self.auto_execute_exit: bool = True
+        self.exit_execution: Optional[Any] = None
+
         logger.info(
             f"RiskManager initialized: SL={self.stop_loss_percent}% (Factor={self.sl_factor}), "
             f"TP={self.take_profit_percent}% (Factor={self.tp_factor}), "
             f"MaxQuoteAge={self.max_quote_age_seconds}s, Multiplier={self.contract_multiplier}"
+        )
+
+    def link_order_manager(
+        self,
+        order_manager: Any,
+        position_tracker: Optional[Any] = None,
+        auto_execute_exit: bool = True,
+    ) -> None:
+        """
+        Link RiskManager directly to OrderManager and PositionTracker (Part 12).
+        Enables seamless automated position closure upon SL or TP breach.
+        """
+        self.order_manager = order_manager
+        self.position_tracker = position_tracker
+        self.auto_execute_exit = auto_execute_exit
+
+        # Bidirectional registration
+        if hasattr(order_manager, "set_risk_manager"):
+            order_manager.set_risk_manager(self)
+        if position_tracker is not None and hasattr(order_manager, "set_position_tracker"):
+            order_manager.set_position_tracker(position_tracker)
+
+        logger.info(
+            f"RiskManager linked to OrderManager (auto_execute_exit={self.auto_execute_exit})"
+        )
+
+    def resolve_exit(self, exit_execution: Any) -> None:
+        """
+        Resolve risk management when exit orders confirm positions are flat (Part 12).
+        Transitions state to RESOLVED.
+        """
+        self.exit_execution = exit_execution
+        self.state = RiskManagerState.RESOLVED
+        logger.info(
+            f"RiskManager RESOLVED: All positions confirmed flat on {exit_execution.trigger_type} "
+            f"(Total exit buyback cost: ${exit_execution.total_exit_cost:.2f} USDT)."
         )
 
     # -------------------------------------------------------------------------
@@ -375,6 +417,7 @@ class RiskManager:
         self.disarm()
         self._cached_quotes.clear()
         self.trigger_event = None
+        self.exit_execution = None
         self.latest_buyback_value = None
         self.latest_unrealized_pnl = None
         self.latest_pnl_percent = None
@@ -570,6 +613,21 @@ class RiskManager:
             self.trigger_event = event
 
             logger.warning(f"CRITICAL RISK EVENT: {event.summary()}")
+
+            # Automated position closure execution (Part 12)
+            if self.order_manager is not None and self.auto_execute_exit:
+                try:
+                    logger.warning(
+                        f"Automating position closure: Invoking OrderManager.initiate_straddle_exit "
+                        f"for {event.trigger_type.value}..."
+                    )
+                    self.exit_execution = self.order_manager.initiate_straddle_exit(
+                        trigger_reason=event.trigger_reason,
+                        trigger_type=event.trigger_type.value,
+                        position_tracker=self.position_tracker,
+                    )
+                except Exception as exit_err:
+                    logger.error(f"Failed to auto-execute exit orders on trigger: {exit_err}", exc_info=True)
 
             # Fire callback if registered
             if self.on_trigger_callback is not None:

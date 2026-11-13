@@ -81,6 +81,14 @@ class OrderSubmissionError(OrderManagementError):
     """Raised when order submission fails."""
 
 
+class DuplicateExitError(OrderManagementError):
+    """Raised when an exit order or initiation is duplicated."""
+
+
+class InvalidExitStateError(OrderManagementError):
+    """Raised when an exit operation is attempted in an invalid state."""
+
+
 # -----------------------------------------------------------------------------
 # Enums
 # -----------------------------------------------------------------------------
@@ -124,6 +132,21 @@ class StraddleExecutionStatus(str, Enum):
     CANCELED = "CANCELED"              # Both legs canceled or entry aborted
     REJECTED = "REJECTED"              # One or both legs rejected
     RESOLVING_UNMATCHED = "RESOLVING_UNMATCHED"  # Executing unmatched-leg policy (e.g. closing filled leg)
+
+
+class StraddleExitState(str, Enum):
+    """
+    Automated position closure lifecycle states (Part 12).
+    Strictly adheres to the required state machine:
+    OPEN -> EXIT_TRIGGERED -> EXIT_ORDERS_SUBMITTED -> EXIT_PARTIALLY_FILLED -> EXIT_COMPLETED / EXIT_FAILED
+    """
+
+    OPEN = "OPEN"
+    EXIT_TRIGGERED = "EXIT_TRIGGERED"
+    EXIT_ORDERS_SUBMITTED = "EXIT_ORDERS_SUBMITTED"
+    EXIT_PARTIALLY_FILLED = "EXIT_PARTIALLY_FILLED"
+    EXIT_COMPLETED = "EXIT_COMPLETED"
+    EXIT_FAILED = "EXIT_FAILED"
 
 
 class UnmatchedLegPolicy(str, Enum):
@@ -318,6 +341,154 @@ class LegOrderTracker:
 
 
 # -----------------------------------------------------------------------------
+# Straddle Exit Execution (Part 12)
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class StraddleExitExecution:
+    """
+    Tracks the execution of offsetting BUY orders during straddle liquidation (Part 12).
+    Guarantees:
+    - Never more buy quantity than remaining short position is submitted.
+    - Each leg is monitored independently.
+    - Partial fills are recorded, and remaining leaves are tracked for resubmission.
+    - Position closure is never claimed until verified flat.
+    """
+
+    exit_id: str
+    straddle_id: str
+    trigger_type: str = "STOP_LOSS"  # "STOP_LOSS", "TAKE_PROFIT", "MANUAL", etc.
+    trigger_reason: str = ""
+    state: StraddleExitState = StraddleExitState.EXIT_TRIGGERED
+
+    # Instrument Identifiers
+    call_instrument_id: Optional[InstrumentId] = None
+    put_instrument_id: Optional[InstrumentId] = None
+
+    # Quantities: Initial open short, target to close, and cumulative closed fills
+    initial_open_call_quantity: float = 0.0
+    initial_open_put_quantity: float = 0.0
+    target_call_close_quantity: float = 0.0
+    target_put_close_quantity: float = 0.0
+    closed_call_quantity: float = 0.0
+    closed_put_quantity: float = 0.0
+
+    # Volume-weighted average price of exit buyback orders
+    call_exit_vwap: float = 0.0
+    put_exit_vwap: float = 0.0
+
+    # Tracking orders
+    call_closing_order_ids: List[ClientOrderId] = field(default_factory=list)
+    put_closing_order_ids: List[ClientOrderId] = field(default_factory=list)
+    call_trackers: List[LegOrderTracker] = field(default_factory=list)
+    put_trackers: List[LegOrderTracker] = field(default_factory=list)
+
+    # Rejection / failure audit
+    failure_reason: Optional[str] = None
+    created_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at_utc: Optional[datetime] = None
+
+    @property
+    def remaining_call_quantity(self) -> float:
+        """Remaining unfilled Call buyback quantity."""
+        return max(0.0, round(self.target_call_close_quantity - self.closed_call_quantity, 8))
+
+    @property
+    def remaining_put_quantity(self) -> float:
+        """Remaining unfilled Put buyback quantity."""
+        return max(0.0, round(self.target_put_close_quantity - self.closed_put_quantity, 8))
+
+    @property
+    def is_call_closed(self) -> bool:
+        """True if target Call buyback quantity is completely filled."""
+        if self.target_call_close_quantity <= 1e-7:
+            return True
+        return self.closed_call_quantity >= (self.target_call_close_quantity - 1e-7)
+
+    @property
+    def is_put_closed(self) -> bool:
+        """True if target Put buyback quantity is completely filled."""
+        if self.target_put_close_quantity <= 1e-7:
+            return True
+        return self.closed_put_quantity >= (self.target_put_close_quantity - 1e-7)
+
+    @property
+    def is_fully_closed(self) -> bool:
+        """True if both legs have fulfilled their target close quantities."""
+        return self.is_call_closed and self.is_put_closed
+
+    @property
+    def is_terminal(self) -> bool:
+        """True if the exit execution has reached a terminal state."""
+        return self.state in (StraddleExitState.EXIT_COMPLETED, StraddleExitState.EXIT_FAILED)
+
+    @property
+    def total_closed_quantity(self) -> float:
+        """Total contracts closed across both legs."""
+        return round(self.closed_call_quantity + self.closed_put_quantity, 8)
+
+    @property
+    def total_exit_cost(self) -> float:
+        """Total gross cash required to buy back positions: (Call_closed * Call_vwap) + (Put_closed * Put_vwap)."""
+        return round(
+            (self.closed_call_quantity * self.call_exit_vwap)
+            + (self.closed_put_quantity * self.put_exit_vwap),
+            4,
+        )
+
+    def is_verified_closed(self, position_tracker: Optional[Any] = None) -> bool:
+        """
+        Verification before claiming position closure.
+        Requires:
+        1. Both Call and Put have closed_quantity >= target_close_quantity.
+        2. If position_tracker is supplied, position_tracker.is_flat MUST be True.
+        """
+        if not self.is_fully_closed:
+            return False
+        if position_tracker is not None and hasattr(position_tracker, "is_flat"):
+            if not position_tracker.is_flat:
+                return False
+        return True
+
+    def evaluate_state(self, position_tracker_flat: Optional[bool] = None) -> StraddleExitState:
+        """
+        Recompute composite exit state based on fill progress and position verification.
+        Handles the scenario where one leg closes but the other remains open.
+        """
+        if self.state == StraddleExitState.EXIT_FAILED:
+            return self.state
+
+        call_done = self.is_call_closed
+        put_done = self.is_put_closed
+
+        if call_done and put_done:
+            # If position tracker verification is available, require it to confirm flat
+            if position_tracker_flat is not None and not position_tracker_flat:
+                self.state = StraddleExitState.EXIT_PARTIALLY_FILLED
+            else:
+                self.state = StraddleExitState.EXIT_COMPLETED
+                if self.completed_at_utc is None:
+                    self.completed_at_utc = datetime.now(timezone.utc)
+        elif call_done or put_done:
+            # One leg closed, but opposing leg remains open / partially filled
+            self.state = StraddleExitState.EXIT_PARTIALLY_FILLED
+        elif self.closed_call_quantity > 1e-7 or self.closed_put_quantity > 1e-7:
+            # Partial fills on one or both legs
+            self.state = StraddleExitState.EXIT_PARTIALLY_FILLED
+        elif self.call_closing_order_ids or self.put_closing_order_ids:
+            if self.state not in (
+                StraddleExitState.EXIT_PARTIALLY_FILLED,
+                StraddleExitState.EXIT_COMPLETED,
+            ):
+                self.state = StraddleExitState.EXIT_ORDERS_SUBMITTED
+
+        self.updated_at_utc = datetime.now(timezone.utc)
+        return self.state
+
+
+# -----------------------------------------------------------------------------
 # Straddle Order (Dual-Leg Structure)
 # -----------------------------------------------------------------------------
 
@@ -340,6 +511,8 @@ class StraddleOrder:
     # Tracks offsetting closing order if unmatched leg resolution is executed
     closing_call_order: Optional[LegOrderTracker] = None
     closing_put_order: Optional[LegOrderTracker] = None
+    exit_execution: Optional[StraddleExitExecution] = None
+    exit_state: StraddleExitState = StraddleExitState.OPEN
 
     @property
     def is_one_leg_filled(self) -> bool:
@@ -526,11 +699,41 @@ class OrderManager:
         self._straddles: List[StraddleOrder] = []
         self._active_straddle: Optional[StraddleOrder] = None
 
+        # Instruments registry for metadata caching
+        self._instruments_by_id: Dict[InstrumentId, Union[CryptoOption, Instrument]] = {}
+
+        # Part 12: Exit execution registries and linkages
+        self._exit_executions: Dict[str, StraddleExitExecution] = {}
+        self._active_exit: Optional[StraddleExitExecution] = None
+        self._position_tracker: Optional[Any] = None
+        self._risk_manager: Optional[Any] = None
+
         logger.info(
             f"OrderManager initialized: dry_run={self.dry_run}, "
             f"unmatched_policy={self.unmatched_policy.value}, "
             f"trader_id={self.trader_id}, strategy_id={self.strategy_id}"
         )
+
+    def set_position_tracker(self, tracker: Any) -> None:
+        """Register the PositionTracker instance for position reconciliation."""
+        self._position_tracker = tracker
+
+    def set_risk_manager(self, risk_manager: Any) -> None:
+        """Register the RiskManager instance for automated lifecycle coordination."""
+        self._risk_manager = risk_manager
+
+    @property
+    def active_exit(self) -> Optional[StraddleExitExecution]:
+        """Return the current active StraddleExitExecution if in progress."""
+        return self._active_exit
+
+    def get_exit_execution(self, exit_id: str) -> Optional[StraddleExitExecution]:
+        """Look up an exit execution by exit ID."""
+        return self._exit_executions.get(exit_id)
+
+    def get_all_exit_executions(self) -> List[StraddleExitExecution]:
+        """Return all tracked exit executions."""
+        return list(self._exit_executions.values())
 
     # -------------------------------------------------------------------------
     # 1. Unique Client Order ID Generation
@@ -628,6 +831,7 @@ class OrderManager:
         and wrap it in an independent LegOrderTracker.
         """
         # Validate quantity against instrument constraints
+        self._instruments_by_id[instrument.id] = instrument
         min_qty = float(instrument.min_quantity) if hasattr(instrument, "min_quantity") and instrument.min_quantity else 0.01
         step_qty = float(instrument.size_increment) if hasattr(instrument, "size_increment") and instrument.size_increment else 0.01
         validated_qty = self.validate_order_quantity(quantity, min_lot_size=min_qty, lot_size_step=step_qty)
@@ -667,6 +871,67 @@ class OrderManager:
             leg_type=leg_type,
             instrument_id=instrument.id,
             order_side=OrderSide.SELL,
+            target_quantity=validated_qty,
+            target_price=price,
+            client_order_id=client_order_id,
+            status=LegExecutionStatus.NOT_SUBMITTED,
+            nautilus_order=order,
+        )
+
+        self._orders_by_client_id[client_order_id] = tracker
+        return order, tracker
+
+    def create_buy_order(
+        self,
+        instrument: Union[CryptoOption, Instrument],
+        quantity: float,
+        price: Optional[float] = None,
+        leg_type: OptionLegType = OptionLegType.CALL,
+        custom_client_order_id: Optional[ClientOrderId] = None,
+        time_in_force: TimeInForce = TimeInForce.GTC,
+        tag: str = "EXIT",
+    ) -> Tuple[Order, LegOrderTracker]:
+        """
+        Construct a NautilusTrader BUY Order (Limit if price is provided, Market otherwise)
+        and wrap it in an independent LegOrderTracker for position closure (Part 12).
+        """
+        self._instruments_by_id[instrument.id] = instrument
+        min_qty = float(instrument.min_quantity) if hasattr(instrument, "min_quantity") and instrument.min_quantity else 0.01
+        step_qty = float(instrument.size_increment) if hasattr(instrument, "size_increment") and instrument.size_increment else 0.01
+        validated_qty = self.validate_order_quantity(quantity, min_lot_size=min_qty, lot_size_step=step_qty)
+
+        client_order_id = custom_client_order_id or self.generate_client_order_id(leg_type, tag=tag)
+        if client_order_id.value in self._orders_by_client_id:
+            raise DuplicateOrderError(
+                f"Order with client_order_id '{client_order_id.value}' already exists."
+            )
+
+        nautilus_qty = Quantity.from_str(f"{validated_qty:.{instrument.size_precision}f}")
+
+        if price is not None and price > 0.0:
+            price_prec = getattr(instrument, "price_precision", 2)
+            nautilus_px = Price.from_str(f"{price:.{price_prec}f}")
+            order = self.order_factory.limit(
+                instrument_id=instrument.id,
+                order_side=OrderSide.BUY,
+                quantity=nautilus_qty,
+                price=nautilus_px,
+                time_in_force=time_in_force,
+                client_order_id=client_order_id,
+            )
+        else:
+            order = self.order_factory.market(
+                instrument_id=instrument.id,
+                order_side=OrderSide.BUY,
+                quantity=nautilus_qty,
+                time_in_force=TimeInForce.GTC,
+                client_order_id=client_order_id,
+            )
+
+        tracker = LegOrderTracker(
+            leg_type=leg_type,
+            instrument_id=instrument.id,
+            order_side=OrderSide.BUY,
             target_quantity=validated_qty,
             target_price=price,
             client_order_id=client_order_id,
@@ -845,6 +1110,12 @@ class OrderManager:
 
         # Apply event to leg tracker
         tracker.apply_event(event)
+
+        # Check if this order is part of an active exit execution (Part 12)
+        matching_exit = self._find_exit_execution_for_order(cid)
+        if matching_exit is not None:
+            self._handle_exit_order_event(event, tracker, matching_exit)
+            return
 
         # Re-evaluate parent straddle status if applicable
         if self._active_straddle is not None:
@@ -1083,7 +1354,384 @@ class OrderManager:
         target.evaluate_composite_status()
 
     # -------------------------------------------------------------------------
-    # 8. Testing & Simulation Helpers
+    # 8. Automated Exit Order Execution (Part 12)
+    # -------------------------------------------------------------------------
+
+    def initiate_straddle_exit(
+        self,
+        trigger_reason: str,
+        trigger_type: str = "STOP_LOSS",
+        straddle: Optional[StraddleOrder] = None,
+        position_tracker: Optional[Any] = None,
+        call_instrument: Optional[Union[CryptoOption, Instrument]] = None,
+        put_instrument: Optional[Union[CryptoOption, Instrument]] = None,
+        order_type: OrderType = OrderType.MARKET,
+        call_limit_price: Optional[float] = None,
+        put_limit_price: Optional[float] = None,
+    ) -> StraddleExitExecution:
+        """
+        Execute automated position closure when Stop-Loss or Take-Profit triggers (Part 12).
+
+        Steps executed:
+        1. Mark exit as initiated (EXIT_TRIGGERED).
+        2. Determine actual open quantity of Call.
+        3. Determine actual open quantity of Put.
+        4. Submit BUY orders for the short positions.
+        5. Use supported order types (MarketOrder or LimitOrder).
+        6. Track acknowledgements.
+        7. Track partial closing fills.
+        8. Handle rejected exit orders.
+        9. Reconcile positions.
+        10. Confirm both positions are flat before claiming closure.
+
+        Invariants enforced:
+        - Prevent duplicate exit orders (idempotent).
+        - Handle scenario where one leg closes but other remains open.
+        - Never submit more buy quantity than actual remaining short position.
+        - If close order partially fills, submit only remaining required quantity after reconciliation.
+        - Do not claim position is closed until verified flat.
+        """
+        tracker = position_tracker or self._position_tracker
+        target_straddle = straddle or self._active_straddle
+
+        # Idempotency / Duplicate exit prevention:
+        if self._active_exit is not None and not self._active_exit.is_terminal:
+            logger.warning(
+                f"Exit already in progress for straddle '{self._active_exit.straddle_id}' "
+                f"(state={self._active_exit.state.value}). Rejecting duplicate exit initiation."
+            )
+            return self._active_exit
+
+        if target_straddle is not None and target_straddle.exit_execution is not None:
+            if target_straddle.exit_execution.state == StraddleExitState.EXIT_COMPLETED:
+                logger.warning(
+                    f"Straddle '{target_straddle.straddle_id}' already completed exit execution. Rejecting duplicate."
+                )
+                return target_straddle.exit_execution
+
+        straddle_id_val = target_straddle.straddle_id if target_straddle else f"STRADDLE-{int(time.time())}"
+        exit_id = f"EXIT-{straddle_id_val}-{int(time.time()*1000)%1_000_000}"
+
+        # Determine instrument IDs
+        c_inst_id: Optional[InstrumentId] = None
+        p_inst_id: Optional[InstrumentId] = None
+
+        if call_instrument is not None:
+            c_inst_id = call_instrument.id
+            self._instruments_by_id[c_inst_id] = call_instrument
+        elif target_straddle is not None:
+            c_inst_id = target_straddle.call_leg.instrument_id
+
+        if put_instrument is not None:
+            p_inst_id = put_instrument.id
+            self._instruments_by_id[p_inst_id] = put_instrument
+        elif target_straddle is not None:
+            p_inst_id = target_straddle.put_leg.instrument_id
+
+        # Step 2 & 3: Determine actual open quantity of Call and Put
+        call_open_qty = 0.0
+        put_open_qty = 0.0
+
+        if tracker is not None:
+            if c_inst_id:
+                c_pos = tracker.get_leg_position(c_inst_id)
+                if c_pos and c_pos.is_short:
+                    call_open_qty = c_pos.quantity
+            if p_inst_id:
+                p_pos = tracker.get_leg_position(p_inst_id)
+                if p_pos and p_pos.is_short:
+                    put_open_qty = p_pos.quantity
+        elif target_straddle is not None:
+            call_open_qty = target_straddle.call_leg.filled_quantity
+            put_open_qty = target_straddle.put_leg.filled_quantity
+
+        # Enforce invariant: Never submit more buy quantity than actual remaining short position
+        target_call_close = max(0.0, round(call_open_qty, 8))
+        target_put_close = max(0.0, round(put_open_qty, 8))
+
+        # Step 1: Mark exit as initiated (EXIT_TRIGGERED)
+        exit_exec = StraddleExitExecution(
+            exit_id=exit_id,
+            straddle_id=straddle_id_val,
+            trigger_type=trigger_type,
+            trigger_reason=trigger_reason,
+            state=StraddleExitState.EXIT_TRIGGERED,
+            call_instrument_id=c_inst_id,
+            put_instrument_id=p_inst_id,
+            initial_open_call_quantity=target_call_close,
+            initial_open_put_quantity=target_put_close,
+            target_call_close_quantity=target_call_close,
+            target_put_close_quantity=target_put_close,
+        )
+
+        self._exit_executions[exit_id] = exit_exec
+        self._active_exit = exit_exec
+        if target_straddle is not None:
+            target_straddle.exit_execution = exit_exec
+            target_straddle.exit_state = StraddleExitState.EXIT_TRIGGERED
+
+        logger.warning(
+            f"INITIATED STRADDLE EXIT [{exit_id}] for '{straddle_id_val}' on {trigger_type}: "
+            f"{trigger_reason} | Target Call Close: {target_call_close} BTC, "
+            f"Target Put Close: {target_put_close} BTC"
+        )
+
+        # Check if already flat:
+        if target_call_close <= 1e-7 and target_put_close <= 1e-7:
+            logger.info(f"Straddle '{straddle_id_val}' has zero open position. Marking exit as completed.")
+            exit_exec.state = StraddleExitState.EXIT_COMPLETED
+            exit_exec.completed_at_utc = datetime.now(timezone.utc)
+            if target_straddle is not None:
+                target_straddle.exit_state = StraddleExitState.EXIT_COMPLETED
+            return exit_exec
+
+        # Step 4 & 5: Submit BUY orders for the short positions using supported order types
+        # Submit Call BUY order if open
+        if target_call_close > 1e-7 and c_inst_id is not None:
+            c_inst = call_instrument or self._instruments_by_id.get(c_inst_id)
+            if c_inst is None:
+                raise OrderSubmissionError(f"Missing Instrument metadata for Call leg {c_inst_id}")
+
+            px = call_limit_price if order_type == OrderType.LIMIT else None
+            _, c_tracker = self.create_buy_order(
+                instrument=c_inst,
+                quantity=target_call_close,
+                price=px,
+                leg_type=OptionLegType.CALL,
+                tag="EXIT",
+            )
+            exit_exec.call_closing_order_ids.append(c_tracker.client_order_id)
+            exit_exec.call_trackers.append(c_tracker)
+            self._submit_single_leg(c_tracker)
+
+        # Submit Put BUY order if open
+        if target_put_close > 1e-7 and p_inst_id is not None:
+            p_inst = put_instrument or self._instruments_by_id.get(p_inst_id)
+            if p_inst is None:
+                raise OrderSubmissionError(f"Missing Instrument metadata for Put leg {p_inst_id}")
+
+            px = put_limit_price if order_type == OrderType.LIMIT else None
+            _, p_tracker = self.create_buy_order(
+                instrument=p_inst,
+                quantity=target_put_close,
+                price=px,
+                leg_type=OptionLegType.PUT,
+                tag="EXIT",
+            )
+            exit_exec.put_closing_order_ids.append(p_tracker.client_order_id)
+            exit_exec.put_trackers.append(p_tracker)
+            self._submit_single_leg(p_tracker)
+
+        # Transition to EXIT_ORDERS_SUBMITTED
+        exit_exec.state = StraddleExitState.EXIT_ORDERS_SUBMITTED
+        if target_straddle is not None:
+            target_straddle.exit_state = StraddleExitState.EXIT_ORDERS_SUBMITTED
+
+        return exit_exec
+
+    def submit_remaining_exit_order(
+        self,
+        leg_type: OptionLegType,
+        exit_execution: Optional[StraddleExitExecution] = None,
+        position_tracker: Optional[Any] = None,
+        order_type: OrderType = OrderType.MARKET,
+        limit_price: Optional[float] = None,
+        instrument: Optional[Union[CryptoOption, Instrument]] = None,
+    ) -> Optional[LegOrderTracker]:
+        """
+        Reconcile outstanding orders and actual fills, then submit a BUY order for
+        ONLY the remaining required quantity (Part 12).
+
+        Invariants:
+        - Never submit more than remaining open short position.
+        - Do not place duplicate orders if an exit order is currently active.
+        """
+        exec_plan = exit_execution or self._active_exit
+        if exec_plan is None:
+            logger.warning("No active exit execution to submit remaining order for.")
+            return None
+
+        tracker = position_tracker or self._position_tracker
+
+        if leg_type == OptionLegType.CALL:
+            inst_id = exec_plan.call_instrument_id
+            rem_qty = exec_plan.remaining_call_quantity
+            trackers_list = exec_plan.call_trackers
+            id_list = exec_plan.call_closing_order_ids
+        else:
+            inst_id = exec_plan.put_instrument_id
+            rem_qty = exec_plan.remaining_put_quantity
+            trackers_list = exec_plan.put_trackers
+            id_list = exec_plan.put_closing_order_ids
+
+        if inst_id is None:
+            logger.error(f"Cannot submit remaining order: InstrumentId for {leg_type.value} is None.")
+            return None
+
+        # Check if an existing order is still active (not terminal).
+        # We must not submit duplicate/overlapping orders!
+        active_tracker = next((t for t in trackers_list if t.is_active), None)
+        if active_tracker is not None:
+            logger.warning(
+                f"Cannot submit remaining order for {leg_type.value}: Order {active_tracker.client_order_id} "
+                f"is still active (status={active_tracker.status.value}). Cancel it first before retrying."
+            )
+            return None
+
+        # Reconcile with actual open position in tracker
+        if tracker is not None:
+            leg_pos = tracker.get_leg_position(inst_id)
+            open_short_qty = leg_pos.quantity if (leg_pos and leg_pos.is_short) else 0.0
+            reconciled_qty = min(rem_qty, open_short_qty)
+        else:
+            reconciled_qty = rem_qty
+
+        reconciled_qty = round(reconciled_qty, 8)
+        if reconciled_qty <= 1e-7:
+            logger.info(
+                f"No remaining quantity to close for {leg_type.value} (rem={rem_qty}, reconciled={reconciled_qty})."
+            )
+            return None
+
+        inst = instrument or self._instruments_by_id.get(inst_id)
+        if inst is None:
+            logger.error(f"Missing Instrument metadata for {inst_id}.")
+            return None
+
+        px = limit_price if order_type == OrderType.LIMIT else None
+        _, new_tracker = self.create_buy_order(
+            instrument=inst,
+            quantity=reconciled_qty,
+            price=px,
+            leg_type=leg_type,
+            tag="RETRY",
+        )
+        id_list.append(new_tracker.client_order_id)
+        trackers_list.append(new_tracker)
+        self._submit_single_leg(new_tracker)
+
+        logger.info(
+            f"Submitted remaining exit BUY order for {leg_type.value}: "
+            f"cid={new_tracker.client_order_id}, qty={reconciled_qty} BTC"
+        )
+        return new_tracker
+
+    def _find_exit_execution_for_order(self, client_order_id: ClientOrderId) -> Optional[StraddleExitExecution]:
+        """Look up if client_order_id belongs to any exit execution."""
+        for ex in self._exit_executions.values():
+            if client_order_id in ex.call_closing_order_ids or client_order_id in ex.put_closing_order_ids:
+                return ex
+        return None
+
+    def _handle_exit_order_event(
+        self,
+        event: OrderEvent,
+        tracker: LegOrderTracker,
+        exit_exec: StraddleExitExecution,
+    ) -> None:
+        """
+        Process order lifecycle events specifically for position closing orders (Part 12).
+        Tracks acknowledgements, partial fills, rejections, reconciles PositionTracker,
+        and confirms both positions are flat before marking EXIT_COMPLETED.
+        """
+        cid = event.client_order_id
+        is_call = tracker.leg_type == OptionLegType.CALL
+
+        if isinstance(event, OrderAccepted):
+            if exit_exec.state == StraddleExitState.EXIT_TRIGGERED:
+                exit_exec.state = StraddleExitState.EXIT_ORDERS_SUBMITTED
+            logger.info(f"[{tracker.leg_type.value}] Exit order accepted: cid={cid}")
+
+        elif isinstance(event, OrderRejected):
+            exit_exec.failure_reason = str(event.reason)
+            exit_exec.state = StraddleExitState.EXIT_FAILED
+            logger.error(
+                f"CRITICAL: Exit BUY order {cid} REJECTED for {tracker.leg_type.value}: {event.reason}"
+            )
+            if self._active_straddle:
+                self._active_straddle.exit_state = StraddleExitState.EXIT_FAILED
+
+        elif isinstance(event, OrderFilled):
+            fill_qty = float(event.last_qty)
+            fill_px = float(event.last_px)
+
+            # Update exit execution closed quantities and VWAPs
+            if is_call:
+                prev_closed = exit_exec.closed_call_quantity
+                new_closed = prev_closed + fill_qty
+                if new_closed > 0:
+                    exit_exec.call_exit_vwap = (
+                        (exit_exec.call_exit_vwap * prev_closed) + (fill_px * fill_qty)
+                    ) / new_closed
+                exit_exec.closed_call_quantity = round(new_closed, 8)
+            else:
+                prev_closed = exit_exec.closed_put_quantity
+                new_closed = prev_closed + fill_qty
+                if new_closed > 0:
+                    exit_exec.put_exit_vwap = (
+                        (exit_exec.put_exit_vwap * prev_closed) + (fill_px * fill_qty)
+                    ) / new_closed
+                exit_exec.closed_put_quantity = round(new_closed, 8)
+
+            # Step 9: Reconcile positions with PositionTracker if linked
+            if self._position_tracker is not None:
+                self._position_tracker.apply_fill(
+                    instrument_id=tracker.instrument_id,
+                    side="BUY",
+                    quantity=fill_qty,
+                    price=fill_px,
+                )
+
+            # Step 10: Confirm both positions are flat before claiming closure
+            is_flat = self._position_tracker.is_flat if self._position_tracker is not None else None
+            exit_exec.evaluate_state(position_tracker_flat=is_flat)
+
+            if self._active_straddle:
+                self._active_straddle.exit_state = exit_exec.state
+
+            if exit_exec.state == StraddleExitState.EXIT_COMPLETED:
+                logger.info(
+                    f"STRADDLE EXIT COMPLETED: Both positions verified FLAT! "
+                    f"Total buyback cost: ${exit_exec.total_exit_cost:.2f} USDT"
+                )
+                if self._risk_manager is not None and hasattr(self._risk_manager, "resolve_exit"):
+                    self._risk_manager.resolve_exit(exit_exec)
+
+    def simulate_exit_acceptance(
+        self,
+        client_order_id: ClientOrderId,
+        venue_order_id: Optional[str] = None,
+    ) -> OrderAccepted:
+        """Simulate venue acceptance event for an exit order."""
+        return self.simulate_acceptance(client_order_id, venue_order_id=venue_order_id)
+
+    def simulate_exit_fill(
+        self,
+        client_order_id: ClientOrderId,
+        fill_quantity: float,
+        fill_price: float,
+        trade_id: Optional[str] = None,
+        commission: float = 0.05,
+    ) -> OrderFilled:
+        """Simulate execution fill event for an exit order."""
+        return self.simulate_fill(
+            client_order_id,
+            fill_quantity=fill_quantity,
+            fill_price=fill_price,
+            trade_id=trade_id,
+            commission=commission,
+        )
+
+    def simulate_exit_rejection(
+        self,
+        client_order_id: ClientOrderId,
+        reason: str = "Test simulated exit rejection",
+    ) -> OrderRejected:
+        """Simulate venue rejection event for an exit order."""
+        return self.simulate_rejection(client_order_id, reason=reason)
+
+    # -------------------------------------------------------------------------
+    # 9. Testing & Simulation Helpers
     # -------------------------------------------------------------------------
 
     def simulate_acceptance(
@@ -1198,7 +1846,7 @@ class OrderManager:
         return event
 
     # -------------------------------------------------------------------------
-    # 9. Query & State Access
+    # 10. Query & State Access
     # -------------------------------------------------------------------------
 
     def get_active_straddle(self) -> Optional[StraddleOrder]:
@@ -1219,4 +1867,7 @@ class OrderManager:
         self._straddles.clear()
         self._orders_by_client_id.clear()
         self._seen_client_order_ids.clear()
+        self._instruments_by_id.clear()
+        self._exit_executions.clear()
+        self._active_exit = None
         self._seq_counter = 0

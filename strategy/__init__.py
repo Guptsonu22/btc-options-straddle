@@ -13,7 +13,9 @@ from .instrument_selector import (
     run_straddle_selection_cli,
 )
 from .order_manager import (
+    DuplicateExitError,
     DuplicateOrderError,
+    InvalidExitStateError,
     InvalidQuantityError,
     LegExecutionStatus,
     LegFill,
@@ -23,6 +25,8 @@ from .order_manager import (
     OrderManager,
     OrderSubmissionError,
     StraddleExecutionStatus,
+    StraddleExitExecution,
+    StraddleExitState,
     StraddleOrder,
     UnmatchedLegError,
     UnmatchedLegPolicy,
@@ -63,6 +67,8 @@ __all__ = [
     "OptionLegType",
     "LegExecutionStatus",
     "StraddleExecutionStatus",
+    "StraddleExitState",
+    "StraddleExitExecution",
     "UnmatchedLegPolicy",
     "LegFill",
     "LegOrderTracker",
@@ -70,7 +76,9 @@ __all__ = [
     "OrderManager",
     "OrderManagementError",
     "DuplicateOrderError",
+    "DuplicateExitError",
     "InvalidQuantityError",
+    "InvalidExitStateError",
     "UnmatchedLegError",
     "OrderSubmissionError",
     # Position Tracking

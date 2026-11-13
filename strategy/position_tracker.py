@@ -149,6 +149,11 @@ class StraddlePosition:
         return abs(self.call_position.quantity - self.put_position.quantity) < 1e-6
 
     @property
+    def is_flat(self) -> bool:
+        """Return True if both Call and Put legs are closed (zero open contracts)."""
+        return self.call_position.quantity <= 1e-7 and self.put_position.quantity <= 1e-7
+
+    @property
     def leg_imbalance_quantity(self) -> float:
         """
         Difference in open contracts: Call Qty - Put Qty.
@@ -244,6 +249,13 @@ class PositionTracker:
         self._positions_by_instrument: Dict[InstrumentId, OptionLegPosition] = {}
         self._active_straddle_position: Optional[StraddlePosition] = None
         self._underlying_price: float = 0.0
+
+    @property
+    def is_flat(self) -> bool:
+        """Return True if all tracked positions are confirmed closed or flat."""
+        if not self._positions_by_instrument:
+            return True
+        return all(not p.is_open for p in self._positions_by_instrument.values())
 
     def register_straddle_pair(
         self,
