@@ -34,6 +34,7 @@ from nautilus_trader.adapters.bybit.factories import (
     get_cached_bybit_instrument_provider,
 )
 from nautilus_trader.config import StrategyConfig, TradingNodeConfig
+from nautilus_trader.core.nautilus_pyo3.bybit import BybitTickersParams
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import QuoteTick, TradeTick
 from nautilus_trader.model.identifiers import InstrumentId
@@ -298,6 +299,67 @@ class MarketDataManager:
         # Retrieve last known trade price for reference
         ltp, ltp_time = self._ltp_cache.get(inst_id_str, (None, None))
 
+        return self._build_and_store_quote(
+            inst_id_str=inst_id_str,
+            bid_val=bid_val,
+            ask_val=ask_val,
+            bid_sz=bid_sz,
+            ask_sz=ask_sz,
+            ts_utc=ts_utc,
+            ts_event_ns=ts_event_ns,
+            ts_init_ns=ts_init_ns,
+            ltp=ltp,
+            ltp_time=ltp_time,
+        )
+
+    def ingest_bybit_ticker(
+        self,
+        instrument_id: str,
+        bid_price: Optional[float],
+        ask_price: Optional[float],
+        bid_size: Optional[float] = None,
+        ask_size: Optional[float] = None,
+        last_price: Optional[float] = None,
+        ts_utc: Optional[datetime] = None,
+    ) -> ValidatedQuote:
+        """
+        Ingest top-of-book ticker snapshot (e.g. from Bybit HTTP tickers endpoint).
+        Provides immediate quote availability before first WebSocket differential tick.
+        """
+        now = ts_utc or datetime.now(timezone.utc)
+        ts_ns = int(now.timestamp() * 1e9)
+
+        if last_price is not None and last_price > 0.0:
+            self._ltp_cache[instrument_id] = (last_price, now)
+
+        ltp, ltp_time = self._ltp_cache.get(instrument_id, (None, None))
+
+        return self._build_and_store_quote(
+            inst_id_str=instrument_id,
+            bid_val=bid_price or 0.0,
+            ask_val=ask_price or 0.0,
+            bid_sz=bid_size or 0.0,
+            ask_sz=ask_size or 0.0,
+            ts_utc=now,
+            ts_event_ns=ts_ns,
+            ts_init_ns=ts_ns,
+            ltp=ltp,
+            ltp_time=ltp_time,
+        )
+
+    def _build_and_store_quote(
+        self,
+        inst_id_str: str,
+        bid_val: float,
+        ask_val: float,
+        bid_sz: float,
+        ask_sz: float,
+        ts_utc: datetime,
+        ts_event_ns: int,
+        ts_init_ns: int,
+        ltp: Optional[float],
+        ltp_time: Optional[datetime],
+    ) -> ValidatedQuote:
         # Perform rigorous validation
         validation_error: Optional[str] = None
         is_valid = True
@@ -450,6 +512,19 @@ class MarketDataDiagnosticStrategy(Strategy):
 
         self._log.info("All market-data subscriptions registered.")
 
+        # Check and log initial snapshot state
+        init_snap = self.mgr.get_straddle_snapshot(
+            underlying_id=str(self.underlying_id),
+            call_id=str(self.call_id),
+            put_id=str(self.put_id),
+        )
+        self._log.info(
+            f"[INITIAL-MARKET-STATE] Underlying: ${init_snap.underlying_price or 0:,.2f} | "
+            f"Call: bid={init_snap.call_bid or 'NO_BID'} ask={init_snap.call_ask or 'NO_ASK'} | "
+            f"Put: bid={init_snap.put_bid or 'NO_BID'} ask={init_snap.put_ask or 'NO_ASK'} | "
+            f"Status: {init_snap.readiness_status}"
+        )
+
     def on_quote_tick(self, tick: QuoteTick) -> None:
         """Handle incoming top-of-book quote tick."""
         self.tick_count += 1
@@ -535,36 +610,7 @@ async def run_market_data_diagnostic(
         logger.error("No active options found to subscribe to.")
         return 1
 
-    # 2. Select first unexpired expiration date and its nearest ATM strike
-    target_exp = chain.expirations[0]
-    strikes = chain.strikes_by_expiry.get(target_exp, [])
-    if not strikes:
-        logger.error(f"No strikes found for expiration {target_exp}.")
-        return 1
-
-    # Pick middle strike as ATM candidate
-    mid_strike = strikes[len(strikes) // 2]
-    call_leg, put_leg = chain.get_straddle_pair(target_exp, mid_strike)
-
-    if not call_leg or not put_leg:
-        # Fallback to first available pair
-        for k in strikes:
-            c, p = chain.get_straddle_pair(target_exp, k)
-            if c and p:
-                call_leg, put_leg = c, p
-                mid_strike = k
-                break
-
-    if not call_leg or not put_leg:
-        logger.error("Could not find a matched Call/Put straddle pair.")
-        return 1
-
-    logger.info(f"Selected Target Expiry: {target_exp.strftime('%Y-%m-%d %H:%M UTC')}")
-    logger.info(f"Selected Strike Price : ${mid_strike:,.0f}")
-    logger.info(f"Call Instrument ID   : {call_leg.instrument_id}")
-    logger.info(f"Put Instrument ID    : {put_leg.instrument_id}")
-
-    # 3. Load underlying Linear perpetual
+    # 2. Load underlying Linear perpetual
     client = get_cached_bybit_http_client(environment=BybitEnvironment.TESTNET)
     lin_provider = get_cached_bybit_instrument_provider(client, (BybitProductType.LINEAR,))
     await lin_provider.load_all_async(filters={"base_coin": "BTC"})
@@ -577,9 +623,81 @@ async def run_market_data_diagnostic(
         logger.error(f"Could not load underlying perpetual instrument {underlying_symbol}")
         return 1
 
+    # 3. Fetch live BTC spot price to determine true ATM strike
+    spot_price = 68000.0
+    lin_tickers = await client.request_tickers(BybitTickersParams(category=BybitProductType.LINEAR, symbol="BTCUSDT"))
+    if lin_tickers:
+        t0 = lin_tickers[0]
+        spot_price = float(t0.last_price or t0.bid1_price or 68000.0)
+        logger.info(f"Live BTC Underlying Reference Price: ${spot_price:,.2f}")
+
+    # 4. Select true ATM strike for target expiration
+    target_exp = chain.expirations[0]
+    atm_strike = chain.find_nearest_atm_strike(spot_price=spot_price, expiration=target_exp)
+    if atm_strike is None:
+        strikes = chain.strikes_by_expiry.get(target_exp, [])
+        atm_strike = strikes[len(strikes) // 2] if strikes else 68000.0
+
+    call_leg, put_leg = chain.get_straddle_pair(target_exp, atm_strike)
+    if not call_leg or not put_leg:
+        # Fallback to first available pair
+        strikes = chain.strikes_by_expiry.get(target_exp, [])
+        for k in strikes:
+            c, p = chain.get_straddle_pair(target_exp, k)
+            if c and p:
+                call_leg, put_leg = c, p
+                atm_strike = k
+                break
+
+    if not call_leg or not put_leg:
+        logger.error("Could not find a matched Call/Put straddle pair.")
+        return 1
+
+    logger.info(f"Target Expiration     : {target_exp.strftime('%Y-%m-%d %H:%M UTC')}")
+    logger.info(f"ATM Strike Selected   : ${atm_strike:,.0f} (Moneyness |K - S| = ${abs(atm_strike - spot_price):,.2f})")
+    logger.info(f"Call Instrument ID    : {call_leg.instrument_id}")
+    logger.info(f"Put Instrument ID     : {put_leg.instrument_id}")
     logger.info(f"Underlying Instrument : {underlying_inst.id}")
 
-    # 4. Build TradingNode
+    # 5. Fetch option tickers to seed initial top-of-book quotes
+    opt_tickers = await client.request_tickers(BybitTickersParams(category=BybitProductType.OPTION, base_coin="BTC"))
+    opt_ticker_map = {t.symbol: t for t in opt_tickers}
+
+    mgr = MarketDataManager(settings=settings)
+    if lin_tickers:
+        t0 = lin_tickers[0]
+        mgr.ingest_bybit_ticker(
+            instrument_id=str(underlying_inst.id),
+            bid_price=float(t0.bid1_price or 0.0),
+            ask_price=float(t0.ask1_price or 0.0),
+            bid_size=float(t0.bid1_size or 0.0),
+            ask_size=float(t0.ask1_size or 0.0),
+            last_price=float(t0.last_price or 0.0),
+        )
+
+    call_t = opt_ticker_map.get(call_leg.raw_symbol)
+    if call_t:
+        mgr.ingest_bybit_ticker(
+            instrument_id=call_leg.instrument_id,
+            bid_price=float(call_t.bid1_price or 0.0),
+            ask_price=float(call_t.ask1_price or 0.0),
+            bid_size=float(call_t.bid1_size or 0.0),
+            ask_size=float(call_t.ask1_size or 0.0),
+            last_price=float(call_t.last_price or 0.0),
+        )
+
+    put_t = opt_ticker_map.get(put_leg.raw_symbol)
+    if put_t:
+        mgr.ingest_bybit_ticker(
+            instrument_id=put_leg.instrument_id,
+            bid_price=float(put_t.bid1_price or 0.0),
+            ask_price=float(put_t.ask1_price or 0.0),
+            bid_size=float(put_t.bid1_size or 0.0),
+            ask_size=float(put_t.ask1_size or 0.0),
+            last_price=float(put_t.last_price or 0.0),
+        )
+
+    # 6. Build TradingNode
     data_cfg = BybitDataClientConfig(
         environment=BybitEnvironment.TESTNET,
         product_types=(BybitProductType.OPTION, BybitProductType.LINEAR),
@@ -594,15 +712,14 @@ async def run_market_data_diagnostic(
     node.add_data_client_factory("BYBIT", BybitLiveDataClientFactory)
     node.build()
 
-    # 5. Populate Node Cache with Instruments
+    # 7. Populate Node Cache with Instruments
     node.cache.add_instrument(underlying_inst)
     if call_leg.nautilus_instrument:
         node.cache.add_instrument(call_leg.nautilus_instrument)
     if put_leg.nautilus_instrument:
         node.cache.add_instrument(put_leg.nautilus_instrument)
 
-    # 6. Initialize MarketDataManager and Mount Strategy
-    mgr = MarketDataManager(settings=settings)
+    # 8. Mount Strategy
     strat = MarketDataDiagnosticStrategy(
         config=StrategyConfig(strategy_id="MKT-DATA-DIAG-01"),
         underlying_id=underlying_inst.id,

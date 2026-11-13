@@ -155,7 +155,7 @@ def test_strict_rejection_of_ltp_for_ask_side_buyback(market_data_manager: Marke
         inst_id,
         Price.from_str("3000.00"),
         Quantity.from_str("0.50"),
-        AggressorSide.BUY,
+        AggressorSide.BUYER,
         TradeId("T-987654321"),
         ts_now_ns,
         ts_now_ns,
