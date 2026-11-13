@@ -266,11 +266,11 @@ class BtcShortStraddleStrategy(Strategy):
 
         # 2. Trigger async discovery of active options chain if running in event loop
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             if loop.is_running():
                 asyncio.create_task(self._async_load_options_chain())
-        except Exception as e:
-            logger.debug(f"Async loop not active in on_start: {e}")
+        except RuntimeError:
+            logger.debug("Async loop not running in on_start.")
 
     def on_stop(self) -> None:
         """
