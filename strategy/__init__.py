@@ -1,4 +1,5 @@
 """Strategy module for BTC Options Straddle."""
+
 from .instrument_selector import (
     ExpirySelectionPolicy,
     IncompletePairError,
@@ -31,6 +32,14 @@ from .position_tracker import (
     OptionLegPosition,
     PositionTracker,
     StraddlePosition,
+)
+from .risk_manager import (
+    PositionNotEstablishedError,
+    RiskManagementError,
+    RiskManager,
+    RiskManagerState,
+    RiskTriggerEvent,
+    RiskTriggerType,
 )
 from .straddle_strategy import (
     BtcShortStraddleStrategy,
@@ -69,9 +78,15 @@ __all__ = [
     "OptionLegPosition",
     "StraddlePosition",
     "LegPositionStatus",
+    # Risk Management
+    "RiskManager",
+    "RiskManagerState",
+    "RiskTriggerType",
+    "RiskTriggerEvent",
+    "RiskManagementError",
+    "PositionNotEstablishedError",
     # Straddle Strategy
     "BtcShortStraddleStrategy",
     "BtcShortStraddleStrategyConfig",
     "StraddleStrategyState",
 ]
-
