@@ -2,7 +2,7 @@
 BTC Options Straddle - Main Initialization Entry Point.
 
 Assignment: Mernplus Technologies BTC Options Straddle
-Stage: Part 5 - Options Discovery & Safe Architecture
+Stage: Part 6 - Market Data Subscriptions & Quote Integrity
 """
 
 import argparse
@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from config.settings import SecurityError, get_settings
 from exchange.bybit_client import run_connectivity_check
 from exchange.instrument_discovery import run_discovery_cli
+from exchange.market_data import run_market_data_diagnostic
 from utils.logger import setup_logger
 
 
@@ -80,6 +81,7 @@ def run_configuration_check() -> int:
     logger.info("Commands:")
     logger.info("  python main.py --connectivity-check  (Verify Testnet WebSockets)")
     logger.info("  python main.py --discover-options    (Discover active BTC options chain)")
+    logger.info("  python main.py --subscribe-quotes    (Stream live quotes & test straddle snapshot)")
     logger.info("=" * 60)
     return 0
 
@@ -102,6 +104,12 @@ def main() -> int:
         help="Query Bybit Testnet and discover available BTC options chain and strikes.",
     )
     parser.add_argument(
+        "--subscribe-quotes",
+        "--market-data-diagnostic",
+        action="store_true",
+        help="Subscribe to live QuoteTick feeds for underlying and ATM straddle legs without placing orders.",
+    )
+    parser.add_argument(
         "--config-check",
         action="store_true",
         help="Audit configuration settings and security boundaries.",
@@ -113,6 +121,8 @@ def main() -> int:
         return run_connectivity_check()
     elif args.discover_options:
         return asyncio.run(run_discovery_cli())
+    elif args.subscribe_quotes:
+        return asyncio.run(run_market_data_diagnostic(duration_seconds=12.0))
     else:
         return run_configuration_check()
 
