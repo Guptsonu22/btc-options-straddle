@@ -26,6 +26,17 @@ from .order_manager import (
     UnmatchedLegError,
     UnmatchedLegPolicy,
 )
+from .position_tracker import (
+    LegPositionStatus,
+    OptionLegPosition,
+    PositionTracker,
+    StraddlePosition,
+)
+from .straddle_strategy import (
+    BtcShortStraddleStrategy,
+    BtcShortStraddleStrategyConfig,
+    StraddleStrategyState,
+)
 
 __all__ = [
     # Instrument Selection
@@ -53,5 +64,14 @@ __all__ = [
     "InvalidQuantityError",
     "UnmatchedLegError",
     "OrderSubmissionError",
+    # Position Tracking
+    "PositionTracker",
+    "OptionLegPosition",
+    "StraddlePosition",
+    "LegPositionStatus",
+    # Straddle Strategy
+    "BtcShortStraddleStrategy",
+    "BtcShortStraddleStrategyConfig",
+    "StraddleStrategyState",
 ]
 
