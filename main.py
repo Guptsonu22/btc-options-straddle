@@ -133,12 +133,12 @@ async def run_order_manager_diagnostic() -> int:
     selector = InstrumentSelector()
     # Use $68,500 reference price or current spot
     ref_price = 68500.0
-    selection = selector.select_straddle(chain, reference_price=ref_price)
+    selection = selector.select_straddle_pair(chain, spot_price=ref_price)
     print(f"      Reference Price:  ${ref_price:,.2f}")
     print(f"      Selected Strike:  ${selection.strike_price:,.2f}")
-    print(f"      Selected Expiry:  {selection.expiration_utc.strftime('%Y-%m-%d %H:%M UTC')} ({selection.dte_days:.2f} DTE)")
-    print(f"      Call Instrument:  {selection.call_id}")
-    print(f"      Put Instrument:   {selection.put_id}")
+    print(f"      Selected Expiry:  {selection.expiration_utc.strftime('%Y-%m-%d %H:%M UTC')} ({selection.time_to_expiry_days:.2f} DTE)")
+    print(f"      Call Instrument:  {selection.call.instrument_id}")
+    print(f"      Put Instrument:   {selection.put.instrument_id}")
 
     # 2. Initialize OrderManager
     print("\n[2/5] Initializing OrderManager with NautilusTrader OrderFactory...")
@@ -150,8 +150,8 @@ async def run_order_manager_diagnostic() -> int:
     # 3. Create short straddle SELL orders
     print("\n[3/5] Creating short straddle SELL orders (Quantity: 0.01 BTC each)...")
     straddle = om.create_straddle_sell_orders(
-        call_instrument=selection.call_details.nautilus_instrument,
-        put_instrument=selection.put_details.nautilus_instrument,
+        call_instrument=selection.call.nautilus_instrument,
+        put_instrument=selection.put.nautilus_instrument,
         quantity=0.01,
         call_price=1250.0,
         put_price=1150.0,
