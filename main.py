@@ -22,7 +22,7 @@ def main() -> int:
     # 1. Initialize secure logging
     logger = setup_logger()
     logger.info("=" * 60)
-    logger.info("Initializing BTC Options Straddle Engine (Part 1)")
+    logger.info("Initializing BTC Options Straddle Engine (Part 3)")
     logger.info("=" * 60)
 
     # 2. Verify NautilusTrader availability & version
@@ -49,21 +49,25 @@ def main() -> int:
         return 3
 
     # 4. Display Safety and Security Barriers
-    logger.info("--- Security & Operational Checks ---")
-    logger.info(f"Runtime Environment : {settings.ENVIRONMENT.upper()} (Enforced)")
-    logger.info(f"Deribit Testnet     : {settings.DERIBIT_TESTNET} (Live trading disabled)")
-    logger.info(f"Trading Mode        : {settings.TRADING_MODE} (Dry run armed)")
-    logger.info(f"Straddle Quantity   : {settings.BTC_STRADDLE_QUANTITY} BTC")
-    logger.info(f"Max Drawdown Limit  : {settings.MAX_DRAWDOWN_PCT}%")
-    logger.info(f"Credential Protection: Verified (SecretStr masking active)")
+    logger.info("--- Security & Operational Configuration ---")
+    logger.info(f"Bybit Testnet       : {settings.BYBIT_TESTNET} (Enforced - Live trading blocked)")
+    logger.info(f"Trading Mode        : {settings.TRADING_MODE} (DRY_RUN={settings.DRY_RUN})")
+    logger.info(f"Underlying Symbol   : {settings.BTC_SYMBOL}")
+    logger.info(f"Order Quantity      : {settings.ORDER_QUANTITY} BTC")
+    logger.info(f"Stop-Loss Threshold : {settings.STOP_LOSS_PERCENT}%")
+    logger.info(f"Take-Profit Target  : {settings.TAKE_PROFIT_PERCENT}%")
+    logger.info(f"Max Quote Age       : {settings.MAX_QUOTE_AGE_SECONDS}s")
+    logger.info(f"Entry Timeout       : {settings.ENTRY_TIMEOUT_SECONDS}s")
+    logger.info(f"Unmatched Leg Policy: {settings.UNMATCHED_LEG_POLICY}")
+    logger.info(f"Credential Masking  : Active (SecretStr)")
 
     logger.info("Safe Config Dump:")
     for key, val in settings.safe_summary().items():
         logger.info(f"  {key}: {val}")
 
     logger.info("=" * 60)
-    logger.info("PART 1 COMPLETE: Project initialized and verified.")
-    logger.info("Exchange connectivity deferred to Part 2 as instructed.")
+    logger.info("PART 3 COMPLETE: Configuration Management verified.")
+    logger.info("No exchange connection initiated (as instructed).")
     logger.info("=" * 60)
     return 0
 
