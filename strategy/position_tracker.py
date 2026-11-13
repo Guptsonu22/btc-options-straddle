@@ -206,6 +206,30 @@ class StraddlePosition:
             return 0.0
         return round((self.total_pnl / self.total_entry_premium) * 100.0, 2)
 
+    @property
+    def stop_loss_threshold(self) -> float:
+        """Stop-loss buyback cost threshold (ENTRY_PREMIUM * 1.01)."""
+        return round(self.total_entry_premium * 1.01, 4)
+
+    @property
+    def take_profit_threshold(self) -> float:
+        """Take-profit buyback cost threshold (ENTRY_PREMIUM * 0.98)."""
+        return round(self.total_entry_premium * 0.98, 4)
+
+    @property
+    def is_stop_loss_triggered(self) -> bool:
+        """True if total buyback cost has risen to or above the SL threshold."""
+        if self.total_entry_premium <= 1e-7 or self.total_buyback_cost <= 1e-7:
+            return False
+        return self.total_buyback_cost >= self.stop_loss_threshold
+
+    @property
+    def is_take_profit_triggered(self) -> bool:
+        """True if total buyback cost has fallen to or below the TP threshold."""
+        if self.total_entry_premium <= 1e-7 or self.total_buyback_cost <= 1e-7:
+            return False
+        return self.total_buyback_cost <= self.take_profit_threshold
+
 
 class PositionTracker:
     """

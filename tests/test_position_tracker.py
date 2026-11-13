@@ -188,3 +188,46 @@ def test_reconcile_with_nautilus_positions(position_tracker, test_instruments):
     assert report["is_synchronized"] is False
     assert len(report["discrepancies"]) == 1
     assert "missing in Nautilus" in report["discrepancies"][0]
+
+
+def test_straddle_position_sl_tp_thresholds(position_tracker, test_instruments):
+    """
+    Verify StraddlePosition Stop-Loss (1.01 * entry) and Take-Profit (0.98 * entry)
+    properties and breach conditions.
+    """
+    call_id, put_id = test_instruments
+    straddle = position_tracker.register_straddle_pair(call_id, put_id, strike_price=70000.0)
+
+    # Short 0.01 Call @ $1,200.00 -> $12.00 entry premium
+    # Short 0.01 Put  @ $1,100.00 -> $11.00 entry premium
+    # Total Entry Premium = $23.00
+    position_tracker.apply_fill(call_id, side="SELL", quantity=0.01, price=1200.0)
+    position_tracker.apply_fill(put_id, side="SELL", quantity=0.01, price=1100.0)
+
+    assert straddle.total_entry_premium == 23.0
+    # SL = 23.0 * 1.01 = 23.23
+    assert straddle.stop_loss_threshold == 23.23
+    # TP = 23.0 * 0.98 = 22.54
+    assert straddle.take_profit_threshold == 22.54
+
+    # 1. Normal state: Buyback cost = $23.00
+    position_tracker.update_leg_quote(call_id, bid=1180.0, ask=1200.0)
+    position_tracker.update_leg_quote(put_id, bid=1080.0, ask=1100.0)
+    assert straddle.total_buyback_cost == 23.00
+    assert straddle.is_stop_loss_triggered is False
+    assert straddle.is_take_profit_triggered is False
+
+    # 2. Theta decay -> hits Take-Profit: Call ask=$1,170, Put ask=$1,080 -> $11.70 + $10.80 = $22.50 <= $22.54
+    position_tracker.update_leg_quote(call_id, bid=1150.0, ask=1170.0)
+    position_tracker.update_leg_quote(put_id, bid=1060.0, ask=1080.0)
+    assert straddle.total_buyback_cost == 22.50
+    assert straddle.is_take_profit_triggered is True
+    assert straddle.is_stop_loss_triggered is False
+
+    # 3. Adverse spike -> hits Stop-Loss: Call ask=$1,250, Put ask=$1,100 -> $12.50 + $11.00 = $23.50 >= $23.23
+    position_tracker.update_leg_quote(call_id, bid=1230.0, ask=1250.0)
+    position_tracker.update_leg_quote(put_id, bid=1080.0, ask=1100.0)
+    assert straddle.total_buyback_cost == 23.50
+    assert straddle.is_stop_loss_triggered is True
+    assert straddle.is_take_profit_triggered is False
+

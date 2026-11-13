@@ -1,4 +1,46 @@
-"""Utility module containing logging and shared helpers."""
-from .logger import setup_logger, get_logger
+"""Utility module containing logging, calculations, and shared helpers."""
 
-__all__ = ["setup_logger", "get_logger"]
+from .calculations import (
+    CalculationError,
+    DEFAULT_CONTRACT_MULTIPLIER,
+    DEFAULT_SL_FACTOR,
+    DEFAULT_TP_FACTOR,
+    InvalidCalculationInputError,
+    MissingQuoteError,
+    StraddleCalculator,
+    StraddlePremiumSnapshot,
+    calculate_entry_premium,
+    calculate_leg_premium,
+    calculate_live_buyback_value,
+    calculate_pnl_percent,
+    calculate_stop_loss_threshold,
+    calculate_take_profit_threshold,
+    calculate_unrealized_pnl,
+    is_stop_loss_triggered,
+    is_take_profit_triggered,
+    to_decimal,
+)
+from .logger import get_logger, setup_logger
+
+__all__ = [
+    "setup_logger",
+    "get_logger",
+    "CalculationError",
+    "InvalidCalculationInputError",
+    "MissingQuoteError",
+    "StraddleCalculator",
+    "StraddlePremiumSnapshot",
+    "calculate_entry_premium",
+    "calculate_leg_premium",
+    "calculate_live_buyback_value",
+    "calculate_pnl_percent",
+    "calculate_stop_loss_threshold",
+    "calculate_take_profit_threshold",
+    "calculate_unrealized_pnl",
+    "is_stop_loss_triggered",
+    "is_take_profit_triggered",
+    "to_decimal",
+    "DEFAULT_CONTRACT_MULTIPLIER",
+    "DEFAULT_SL_FACTOR",
+    "DEFAULT_TP_FACTOR",
+]
