@@ -2,29 +2,11 @@
 BTC Options Straddle - Main Initialization Entry Point.
 
 Assignment: Mernplus Technologies BTC Options Straddle
-Stage: Part 1 - Project Initialization & Environment Setup
-"""
-
-import sys
-from pathlib import Path
-
-# Add project root to path for direct execution
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from config.settings import get_settings, SecurityError
-from utils.logger import setup_logger
-
-
-"""
-BTC Options Straddle - Main Initialization Entry Point.
-
-Assignment: Mernplus Technologies BTC Options Straddle
-Stage: Part 4 - Bybit Testnet Connectivity & Safe Execution Architecture
+Stage: Part 5 - Options Discovery & Safe Architecture
 """
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
@@ -35,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.settings import SecurityError, get_settings
 from exchange.bybit_client import run_connectivity_check
+from exchange.instrument_discovery import run_discovery_cli
 from utils.logger import setup_logger
 
 
@@ -94,7 +77,9 @@ def run_configuration_check() -> int:
 
     logger.info("=" * 60)
     logger.info("Configuration check passed.")
-    logger.info("Run with '--connectivity-check' to verify Bybit Testnet WebSocket link.")
+    logger.info("Commands:")
+    logger.info("  python main.py --connectivity-check  (Verify Testnet WebSockets)")
+    logger.info("  python main.py --discover-options    (Discover active BTC options chain)")
     logger.info("=" * 60)
     return 0
 
@@ -111,6 +96,12 @@ def main() -> int:
         help="Connect to Bybit Testnet WebSocket feeds and verify live handshake.",
     )
     parser.add_argument(
+        "--discover-options",
+        "--discovery",
+        action="store_true",
+        help="Query Bybit Testnet and discover available BTC options chain and strikes.",
+    )
+    parser.add_argument(
         "--config-check",
         action="store_true",
         help="Audit configuration settings and security boundaries.",
@@ -120,10 +111,11 @@ def main() -> int:
 
     if args.connectivity_check:
         return run_connectivity_check()
+    elif args.discover_options:
+        return asyncio.run(run_discovery_cli())
     else:
         return run_configuration_check()
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
